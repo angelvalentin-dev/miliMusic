@@ -2,6 +2,13 @@ name: 🪟 Build Windows Desktop (MSI / EXE / ZIP)
 
 on:
   workflow_dispatch:
+    inputs:
+      formato:
+        description: "Paquete a generar (artefactos separados)"
+        required: true
+        type: choice
+        default: todos
+        options: [ todos, exe, msi, portable ]
 
 permissions:
   contents: read
@@ -35,6 +42,7 @@ jobs:
           arch: x64
 
       - name: Asegurar WiX Toolset 3.x (para MSI/EXE)
+        if: inputs.formato != 'portable'
         shell: pwsh
         run: |
           $wixDefault = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
@@ -77,7 +85,7 @@ jobs:
 
           Remove-Item "desktop/resources/windows/*.exp", "desktop/resources/windows/*.lib", "*.obj" -ErrorAction SilentlyContinue
 
-      - name: Descargar y empaquetar libVLC 3.0.21 (win64)
+      - name: Descargar y empaquetar libVLC 3.0.21 solo audio (win64)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -87,19 +95,55 @@ jobs:
           $vlcRoot = (Get-ChildItem "desktop/native/vlc-extract" -Directory | Select-Object -First 1).FullName
 
           $targetVlc = "desktop/resources/windows/vlc"
-          New-Item -ItemType Directory -Force -Path $targetVlc | Out-Null
+          $targetPlugins = "$targetVlc/plugins"
+          New-Item -ItemType Directory -Force -Path $targetPlugins | Out-Null
           Copy-Item "$vlcRoot/libvlc.dll" "$targetVlc/" -Force
           Copy-Item "$vlcRoot/libvlccore.dll" "$targetVlc/" -Force
-          Copy-Item "$vlcRoot/plugins" "$targetVlc/plugins" -Recurse -Force
 
-      - name: Ejecutar tests y empaquetar MSI, EXE y distribución portable
+          # Solo plugins de audio, HTTP/archivo y demuxers/codecs necesarios (--no-video)
+          foreach ($dir in @("audio_output", "audio_filter", "audio_mixer", "logger")) {
+            if (Test-Path "$vlcRoot/plugins/$dir") {
+              Copy-Item "$vlcRoot/plugins/$dir" "$targetPlugins/$dir" -Recurse -Force
+            }
+          }
+
+          $whitelist = @{
+            access = @("libhttp_plugin.dll", "libhttps_plugin.dll", "libfilesystem_plugin.dll", "libaccess_concat_plugin.dll", "libavio_plugin.dll")
+            codec = @("libavcodec_plugin.dll", "libopus_plugin.dll", "libvorbis_plugin.dll", "libflac_plugin.dll", "libfaad_plugin.dll", "libmpg123_plugin.dll", "libmft_plugin.dll", "liblpcm_plugin.dll", "libaraw_plugin.dll")
+            demux = @("libmp4_plugin.dll", "libmkv_plugin.dll", "libogg_plugin.dll", "libes_plugin.dll", "libflacsys_plugin.dll", "libwav_plugin.dll", "libcaf_plugin.dll", "libaiff_plugin.dll", "libplaylist_plugin.dll", "libadaptive_plugin.dll")
+            misc = @("libxml_plugin.dll", "libgnutls_plugin.dll", "liblogger_plugin.dll", "libstats_plugin.dll")
+            packetizer = @("libpacketizer_copy_plugin.dll", "libpacketizer_flac_plugin.dll", "libpacketizer_mpeg4audio_plugin.dll", "libpacketizer_mpegaudio_plugin.dll", "libpacketizer_a52_plugin.dll", "libpacketizer_dts_plugin.dll")
+            stream_filter = @("libcache_read_plugin.dll", "libcache_block_plugin.dll", "libprefetch_plugin.dll", "libskiptags_plugin.dll", "libinflate_plugin.dll")
+          }
+          foreach ($cat in $whitelist.Keys) {
+            $dstDir = "$targetPlugins/$cat"
+            New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+            foreach ($dll in $whitelist[$cat]) {
+              $src = "$vlcRoot/plugins/$cat/$dll"
+              if (Test-Path $src) {
+                Copy-Item $src "$dstDir/" -Force
+              }
+            }
+          }
+
+          & "$vlcRoot/vlc-cache-gen.exe" "$targetPlugins"
+          $vlcMb = [math]::Round(((Get-ChildItem $targetVlc -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
+          Write-Host "libVLC recortado: $vlcMb MB"
+
+      - name: Ejecutar tests y empaquetar Windows
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          ./gradlew :innertube:test :desktop:test :desktop:packageMsi :desktop:packageExe :desktop:createDistributable --stacktrace
+          $tasks = @(":innertube:test", ":desktop:test")
+          $fmt = "${{ inputs.formato }}"
+          if ($fmt -eq "todos" -or $fmt -eq "exe") { $tasks += ":desktop:packageExe" }
+          if ($fmt -eq "todos" -or $fmt -eq "msi") { $tasks += ":desktop:packageMsi" }
+          if ($fmt -eq "todos" -or $fmt -eq "portable") { $tasks += ":desktop:createDistributable" }
+          ./gradlew @tasks --stacktrace
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Crear ZIP portable
+      - name: Crear ZIP portable (compresión óptima)
+        if: inputs.formato == 'todos' || inputs.formato == 'portable'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -108,15 +152,43 @@ jobs:
             throw "No se encontró el directorio distribuible en $distDir"
           }
           New-Item -ItemType Directory -Force -Path "desktop/build/portable" | Out-Null
-          Compress-Archive -Path "$distDir\*" -DestinationPath "desktop/build/portable/miliMusic-windows-x64-portable.zip" -Force
+          Compress-Archive -Path "$distDir\*" -DestinationPath "desktop/build/portable/miliMusic-windows-x64-portable.zip" -CompressionLevel Optimal -Force
 
-      - name: Subir instaladores y ZIP portable
+      - name: Subir instalador EXE
+        if: inputs.formato == 'todos' || inputs.formato == 'exe'
         uses: actions/upload-artifact@v4
         with:
-          name: miliMusic-windows-x64
-          path: |
-            desktop/build/compose/binaries/main/msi/*.msi
-            desktop/build/compose/binaries/main/exe/*.exe
-            desktop/build/portable/*.zip
+          name: miliMusic-windows-x64-exe
+          path: desktop/build/compose/binaries/main/exe/*.exe
           if-no-files-found: error
           retention-days: 14
+
+      - name: Subir instalador MSI
+        if: inputs.formato == 'todos' || inputs.formato == 'msi'
+        uses: actions/upload-artifact@v4
+        with:
+          name: miliMusic-windows-x64-msi
+          path: desktop/build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Subir versión portable ZIP
+        if: inputs.formato == 'todos' || inputs.formato == 'portable'
+        uses: actions/upload-artifact@v4
+        with:
+          name: miliMusic-windows-x64-portable
+          path: desktop/build/portable/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Resumen de tamaños
+        shell: pwsh
+        run: |
+          $lines = @("## 🪟 Build Windows x64", "")
+          foreach ($glob in @("desktop/build/compose/binaries/main/exe/*.exe", "desktop/build/compose/binaries/main/msi/*.msi", "desktop/build/portable/*.zip")) {
+            Get-ChildItem $glob -ErrorAction SilentlyContinue | ForEach-Object {
+              $mb = [math]::Round($_.Length / 1MB, 1)
+              $lines += "- **$($_.Name)**: $mb MB"
+            }
+          }
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

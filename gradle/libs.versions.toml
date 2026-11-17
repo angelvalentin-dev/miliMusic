@@ -119,7 +119,7 @@ coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", 
 vlcj = { module = "uk.co.caprica:vlcj", version.ref = "vlcj" }
 sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
 jna-platform = { module = "net.java.dev.jna:jna-platform", version.ref = "jna" }
-compose-icons-extended = { module = "org.jetbrains.compose.material:material-icons-extended", version.ref = "composeIcons" }
+compose-icons-core = { module = "org.jetbrains.compose.material:material-icons-core", version.ref = "composeIcons" }
 
 [plugins]
 compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

@@ -25,7 +25,7 @@ dependencies {
     implementation(compose.runtime)
     implementation(compose.ui)
     implementation(compose.animation)
-    implementation(libs.compose.icons.extended)
+    implementation(libs.compose.icons.core)
     implementation(libs.materialKolor)
     implementation(libs.compose.reorderable)
 

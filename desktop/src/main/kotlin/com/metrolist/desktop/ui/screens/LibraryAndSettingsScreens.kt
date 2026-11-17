@@ -25,11 +25,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.Backup
-import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.Restore
-import androidx.compose.material.icons.rounded.Sync
+import com.metrolist.desktop.ui.icons.Backup
+import com.metrolist.desktop.ui.icons.FolderOpen
+import com.metrolist.desktop.ui.icons.Restore
+import com.metrolist.desktop.ui.icons.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
