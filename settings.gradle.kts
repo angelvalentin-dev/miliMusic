@@ -24,6 +24,7 @@ dependencyResolutionManagement {
                     includeModule("com.github.MetrolistGroup", "innertubex")
                     includeModule("com.github.MetrolistGroup", "innertubex-android")
                     includeModule("com.github.MetrolistGroup", "innertubex-desktop")
+                    includeGroup("com.github.MetrolistGroup.quackjs")
                 } else {
                     includeGroup("com.github.MetrolistGroup.innertubex")
                 }
@@ -40,3 +41,4 @@ dependencyResolutionManagement {
 rootProject.name = "Metrolist"
 include(":app")
 include(":innertube")
+include(":desktop")

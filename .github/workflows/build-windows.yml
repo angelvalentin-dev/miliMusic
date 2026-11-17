@@ -1,0 +1,122 @@
+name: 🪟 Build Windows Desktop (MSI / EXE / ZIP)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 Desktop
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Caché de Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configurar MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Asegurar WiX Toolset 3.x (para MSI/EXE)
+        shell: pwsh
+        run: |
+          $wixDefault = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            if (Test-Path "$wixDefault\candle.exe") {
+              "$wixDefault" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            } else {
+              choco install wixtoolset -y --no-progress
+              if (Test-Path "$wixDefault\candle.exe") {
+                "$wixDefault" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              }
+            }
+          }
+
+      - name: Compilar helpers nativos Windows (WebView2 Login + SMTC DLL)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "desktop/resources/windows" | Out-Null
+          New-Item -ItemType Directory -Force -Path "desktop/native/packages/webview2" | Out-Null
+
+          curl.exe -fSL "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2" -o "desktop/native/packages/webview2.zip"
+          Expand-Archive -Path "desktop/native/packages/webview2.zip" -DestinationPath "desktop/native/packages/webview2" -Force
+
+          $wv2Inc = "desktop/native/packages/webview2/build/native/include"
+          $wv2Lib = "desktop/native/packages/webview2/build/native/x64/WebView2Loader.dll.lib"
+          Copy-Item "desktop/native/packages/webview2/build/native/x64/WebView2Loader.dll" "desktop/resources/windows/WebView2Loader.dll" -Force
+
+          cl /nologo /O2 /EHsc /std:c++17 /DUNICODE /D_UNICODE /I"$wv2Inc" `
+            "desktop/native/webview2-login/main.cpp" `
+            /Fe:"desktop/resources/windows/milimusic-login.exe" `
+            /link "$wv2Lib" user32.lib shell32.lib ole32.lib oleaut32.lib /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cl /nologo /O2 /EHsc /std:c++20 /LD /DUNICODE /D_UNICODE `
+            "desktop/native/smtc-bridge/smtc_bridge.cpp" `
+            /Fe:"desktop/resources/windows/milimusic_smtc.dll" `
+            /link windowsapp.lib ole32.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Remove-Item "desktop/resources/windows/*.exp", "desktop/resources/windows/*.lib", "*.obj" -ErrorAction SilentlyContinue
+
+      - name: Descargar y empaquetar libVLC 3.0.21 (win64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vlcUrl = "https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.7z"
+          curl.exe -fSL "$vlcUrl" -o "desktop/native/vlc.7z"
+          7z x "desktop/native/vlc.7z" "-odesktop/native/vlc-extract" -y | Out-Null
+          $vlcRoot = (Get-ChildItem "desktop/native/vlc-extract" -Directory | Select-Object -First 1).FullName
+
+          $targetVlc = "desktop/resources/windows/vlc"
+          New-Item -ItemType Directory -Force -Path $targetVlc | Out-Null
+          Copy-Item "$vlcRoot/libvlc.dll" "$targetVlc/" -Force
+          Copy-Item "$vlcRoot/libvlccore.dll" "$targetVlc/" -Force
+          Copy-Item "$vlcRoot/plugins" "$targetVlc/plugins" -Recurse -Force
+
+      - name: Ejecutar tests y empaquetar MSI, EXE y distribución portable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./gradlew :innertube:test :desktop:test :desktop:packageMsi :desktop:packageExe :desktop:createDistributable --stacktrace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Crear ZIP portable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $distDir = "desktop/build/compose/binaries/main/app/miliMusic"
+          if (-not (Test-Path $distDir)) {
+            throw "No se encontró el directorio distribuible en $distDir"
+          }
+          New-Item -ItemType Directory -Force -Path "desktop/build/portable" | Out-Null
+          Compress-Archive -Path "$distDir\*" -DestinationPath "desktop/build/portable/miliMusic-windows-x64-portable.zip" -Force
+
+      - name: Subir instaladores y ZIP portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: miliMusic-windows-x64
+          path: |
+            desktop/build/compose/binaries/main/msi/*.msi
+            desktop/build/compose/binaries/main/exe/*.exe
+            desktop/build/portable/*.zip
+          if-no-files-found: error
+          retention-days: 14
