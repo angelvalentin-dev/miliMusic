@@ -62,11 +62,15 @@ compose.desktop {
             licenseFile.set(rootProject.file("LICENSE"))
 
             modules(
-                "java.sql",
-                "java.naming",
+                "java.instrument",
                 "java.logging",
-                "jdk.unsupported",
+                "java.management",
+                "java.naming",
+                "java.sql",
+                "jdk.accessibility",
                 "jdk.crypto.ec",
+                "jdk.httpserver",
+                "jdk.unsupported",
             )
 
             appResourcesRootDir.set(project.layout.projectDirectory.dir("resources"))
