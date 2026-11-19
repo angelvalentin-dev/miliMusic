@@ -58,6 +58,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -65,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import com.metrolist.desktop.audio.RepeatMode
 import com.metrolist.desktop.state.DesktopAppState
 import com.metrolist.desktop.state.NavDestination
+import kotlin.math.roundToInt
 
 @Composable
 fun DesktopPlayerBar(appState: DesktopAppState) {
@@ -80,7 +86,10 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
         tonalElevation = 4.dp,
         shadowElevation = 8.dp,
         color = MaterialTheme.colorScheme.surfaceContainer,
-        modifier = Modifier.fillMaxWidth().height(88.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(88.dp)
+            .semantics { contentDescription = "Barra del reproductor multimedia" },
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
@@ -95,11 +104,15 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                 ) {
                     ArtworkImage(
                         url = song?.thumbnailUrl,
-                        contentDescription = song?.title,
+                        contentDescription = song?.let { "Carátula de ${it.title}" } ?: "Sin carátula",
                         modifier = Modifier
                             .size(56.dp)
                             .clip(RoundedCornerShape(10.dp))
-                            .clickable(enabled = song != null) { appState.toggleFullPlayer() },
+                            .clickable(
+                                enabled = song != null,
+                                role = Role.Button,
+                                onClickLabel = "Abrir reproductor a pantalla completa",
+                            ) { appState.toggleFullPlayer() },
                     )
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
@@ -109,7 +122,11 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.clickable(enabled = song != null) {
+                            modifier = Modifier.clickable(
+                                enabled = song != null,
+                                role = Role.Button,
+                                onClickLabel = "Abrir reproductor a pantalla completa",
+                            ) {
                                 appState.toggleFullPlayer()
                             },
                         )
@@ -119,7 +136,11 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.clickable(enabled = song?.artists?.firstOrNull()?.id?.startsWith("artist_") == false) {
+                            modifier = Modifier.clickable(
+                                enabled = song?.artists?.firstOrNull()?.id?.startsWith("artist_") == false,
+                                role = Role.Button,
+                                onClickLabel = "Ir a la página del artista ${song?.artistDisplay.orEmpty()}",
+                            ) {
                                 song?.artists?.firstOrNull()?.id?.let { appState.navigate(NavDestination.Artist(it)) }
                             },
                         )
@@ -129,7 +150,7 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                         IconButton(onClick = { appState.toggleLike(song) }) {
                             Icon(
                                 imageVector = if (isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                                contentDescription = "Me gusta",
+                                contentDescription = if (isLiked) "Quitar ${song.title} de Me gusta" else "Añadir ${song.title} a Me gusta",
                                 tint = if (isLiked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -148,13 +169,13 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                         IconButton(onClick = { appState.audioPlayer.toggleShuffle() }, modifier = Modifier.size(34.dp)) {
                             Icon(
                                 Icons.Rounded.Shuffle,
-                                contentDescription = "Aleatorio",
+                                contentDescription = if (pb.shuffle) "Modo aleatorio activado" else "Modo aleatorio desactivado",
                                 tint = if (pb.shuffle) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(20.dp),
                             )
                         }
                         IconButton(onClick = { appState.audioPlayer.previous() }, modifier = Modifier.size(36.dp)) {
-                            Icon(Icons.Rounded.SkipPrevious, contentDescription = "Anterior")
+                            Icon(Icons.Rounded.SkipPrevious, contentDescription = "Canción anterior (Ctrl+Izquierda)")
                         }
                         FilledIconButton(
                             onClick = { appState.audioPlayer.togglePlayPause() },
@@ -163,24 +184,31 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                         ) {
                             if (pb.isBuffering) {
                                 CircularProgressIndicator(
-                                    modifier = Modifier.size(20.dp),
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .semantics { contentDescription = "Cargando audio" },
                                     color = MaterialTheme.colorScheme.onPrimary,
                                     strokeWidth = 2.dp,
                                 )
                             } else {
                                 Icon(
                                     imageVector = if (pb.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                    contentDescription = if (pb.isPlaying) "Pausar" else "Reproducir",
+                                    contentDescription = if (pb.isPlaying) "Pausar (Espacio)" else "Reproducir (Espacio)",
                                 )
                             }
                         }
                         IconButton(onClick = { appState.audioPlayer.next() }, modifier = Modifier.size(36.dp)) {
-                            Icon(Icons.Rounded.SkipNext, contentDescription = "Siguiente")
+                            Icon(Icons.Rounded.SkipNext, contentDescription = "Siguiente canción (Ctrl+Derecha)")
+                        }
+                        val repeatDesc = when (pb.repeatMode) {
+                            RepeatMode.OFF -> "Repetir desactivado"
+                            RepeatMode.ALL -> "Repetir toda la cola activado"
+                            RepeatMode.ONE -> "Repetir canción actual activado"
                         }
                         IconButton(onClick = { appState.audioPlayer.cycleRepeatMode() }, modifier = Modifier.size(34.dp)) {
                             Icon(
                                 imageVector = if (pb.repeatMode == RepeatMode.ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
-                                contentDescription = "Repetir",
+                                contentDescription = repeatDesc,
                                 tint = if (pb.repeatMode != RepeatMode.OFF) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(20.dp),
                             )
@@ -209,7 +237,13 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                                 draggingPosition = null
                             },
                             enabled = song != null && pb.durationMs > 0L,
-                            modifier = Modifier.weight(1f).height(20.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(20.dp)
+                                .semantics {
+                                    contentDescription = "Posición de reproducción"
+                                    stateDescription = "${formatTimeMs(displayPos)} de ${formatTimeMs(pb.durationMs)}"
+                                },
                         )
                         Text(
                             text = formatTimeMs(pb.durationMs),
@@ -221,37 +255,118 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                     }
                 }
 
-                // Right: lyrics, queue, volume
+                // Right: EQ/speed, sleep timer, lyrics, queue, volume
                 Row(
-                    modifier = Modifier.weight(0.28f),
+                    modifier = Modifier.weight(0.32f),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.End,
                 ) {
+                    val eqOrSpeedActive = pb.eqEnabled || kotlin.math.abs(pb.playbackSpeed - 1.0f) >= 0.03f
+                    val eqLabel = "Ecualizador y velocidad (Ctrl+E): ${if (pb.eqEnabled) "Preset ${pb.eqPreset}" else "Ecualizador desactivado"}, velocidad ${"%.2f".format(pb.playbackSpeed).trimEnd('0').trimEnd('.')}x"
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (eqOrSpeedActive) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceContainerHigh
+                        },
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .semantics(mergeDescendants = true) {
+                                contentDescription = eqLabel
+                            }
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = "Abrir ecualizador y velocidad de reproducción",
+                            ) { appState.openEqualizerDialog() },
+                    ) {
+                        Text(
+                            text = if (kotlin.math.abs(pb.playbackSpeed - 1.0f) >= 0.03f) {
+                                "EQ • ${"%.2f".format(pb.playbackSpeed).trimEnd('0').trimEnd('.')}x"
+                            } else {
+                                "EQ"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (eqOrSpeedActive) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        )
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    val sleepActive = pb.sleepTimerEndOfTrack || pb.sleepTimerRemainingMs != null
+                    val sleepLabel = when {
+                        pb.sleepTimerRemainingMs != null -> "Temporizador de apagado activo: quedan ${formatTimeMs(pb.sleepTimerRemainingMs!!)}"
+                        pb.sleepTimerEndOfTrack -> "Temporizador de apagado activo: se detendrá al terminar la canción"
+                        else -> "Temporizador de apagado desactivado"
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (sleepActive) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceContainerHigh
+                        },
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .semantics(mergeDescendants = true) {
+                                contentDescription = sleepLabel
+                            }
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = "Configurar temporizador de apagado",
+                            ) { appState.openSleepTimerDialog() },
+                    ) {
+                        Text(
+                            text = when {
+                                pb.sleepTimerRemainingMs != null -> "⏱ ${formatTimeMs(pb.sleepTimerRemainingMs!!)}"
+                                pb.sleepTimerEndOfTrack -> "⏱ Fin"
+                                else -> "⏱"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (sleepActive) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        )
+                    }
                     IconButton(onClick = appState::toggleLyricsPanel) {
                         Icon(
                             Icons.Rounded.Lyrics,
-                            contentDescription = "Letras",
+                            contentDescription = if (showLyrics) "Ocultar letras (Ctrl+L)" else "Mostrar letras (Ctrl+L)",
                             tint = if (showLyrics) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     IconButton(onClick = appState::toggleQueuePanel) {
                         Icon(
                             Icons.AutoMirrored.Rounded.QueueMusic,
-                            contentDescription = "Cola",
+                            contentDescription = if (showQueue) "Ocultar cola de reproducción (Ctrl+Q)" else "Mostrar cola de reproducción (Ctrl+Q)",
                             tint = if (showQueue) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     IconButton(onClick = { appState.audioPlayer.toggleMute() }) {
                         Icon(
                             imageVector = if (pb.isMuted || pb.volume == 0f) Icons.AutoMirrored.Rounded.VolumeOff else Icons.AutoMirrored.Rounded.VolumeUp,
-                            contentDescription = "Silenciar",
+                            contentDescription = if (pb.isMuted || pb.volume == 0f) "Activar sonido" else "Silenciar",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    val effectiveVolPercent = ((if (pb.isMuted) 0f else pb.volume) * 100f).roundToInt()
                     Slider(
                         value = if (pb.isMuted) 0f else pb.volume,
                         onValueChange = { appState.audioPlayer.setVolume(it) },
-                        modifier = Modifier.width(105.dp),
+                        modifier = Modifier
+                            .width(92.dp)
+                            .semantics {
+                                contentDescription = "Volumen"
+                                stateDescription = "$effectiveVolPercent por ciento"
+                            },
                     )
                 }
             }
@@ -287,11 +402,15 @@ fun RightSidePanel(appState: DesktopAppState) {
                             text = if (showLyrics) "Letras" else "Cola de reproducción",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
+                            modifier = Modifier.semantics { heading() },
                         )
                         IconButton(onClick = {
                             if (showLyrics) appState.toggleLyricsPanel() else appState.toggleQueuePanel()
                         }) {
-                            Icon(Icons.Rounded.Close, contentDescription = "Cerrar")
+                            Icon(
+                                Icons.Rounded.Close,
+                                contentDescription = if (showLyrics) "Cerrar panel de letras" else "Cerrar panel de cola",
+                            )
                         }
                     }
                     Spacer(Modifier.height(8.dp))
@@ -315,7 +434,7 @@ fun LyricsContentView(appState: DesktopAppState, centered: Boolean) {
 
     if (loading) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator()
+            CircularProgressIndicator(modifier = Modifier.semantics { contentDescription = "Cargando letras" })
         }
         return
     }
@@ -364,7 +483,11 @@ fun LyricsContentView(appState: DesktopAppState, centered: Boolean) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable(enabled = lyrics.isSynced) {
+                        .clickable(
+                            enabled = lyrics.isSynced,
+                            role = Role.Button,
+                            onClickLabel = "Saltar al segundo ${formatTimeMs(line.timeMs)}",
+                        ) {
                             appState.audioPlayer.seekTo(line.timeMs)
                         }
                         .padding(vertical = 4.dp, horizontal = 6.dp),
@@ -391,7 +514,10 @@ fun QueueContentView(appState: DesktopAppState) {
                 shape = RoundedCornerShape(8.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { appState.audioPlayer.jumpToIndex(idx) },
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "Reproducir ${song.title} de la cola",
+                    ) { appState.audioPlayer.jumpToIndex(idx) },
             ) {
                 Row(
                     modifier = Modifier.padding(8.dp),
@@ -417,16 +543,28 @@ fun QueueContentView(appState: DesktopAppState) {
                     }
                     if (idx > 0) {
                         IconButton(onClick = { appState.audioPlayer.reorderQueue(idx, idx - 1) }, modifier = Modifier.size(26.dp)) {
-                            Icon(Icons.Rounded.ArrowUpward, null, modifier = Modifier.size(16.dp))
+                            Icon(
+                                Icons.Rounded.ArrowUpward,
+                                contentDescription = "Mover ${song.title} hacia arriba en la cola",
+                                modifier = Modifier.size(16.dp),
+                            )
                         }
                     }
                     if (idx < pb.queue.lastIndex) {
                         IconButton(onClick = { appState.audioPlayer.reorderQueue(idx, idx + 1) }, modifier = Modifier.size(26.dp)) {
-                            Icon(Icons.Rounded.ArrowDownward, null, modifier = Modifier.size(16.dp))
+                            Icon(
+                                Icons.Rounded.ArrowDownward,
+                                contentDescription = "Mover ${song.title} hacia abajo en la cola",
+                                modifier = Modifier.size(16.dp),
+                            )
                         }
                     }
                     IconButton(onClick = { appState.audioPlayer.removeFromQueue(idx) }, modifier = Modifier.size(26.dp)) {
-                        Icon(Icons.Rounded.Close, null, modifier = Modifier.size(16.dp))
+                        Icon(
+                            Icons.Rounded.Close,
+                            contentDescription = "Quitar ${song.title} de la cola",
+                            modifier = Modifier.size(16.dp),
+                        )
                     }
                 }
             }
@@ -461,9 +599,14 @@ fun FullPlayerOverlay(appState: DesktopAppState) {
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("Reproduciendo ahora", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "Reproduciendo ahora",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.semantics { heading() },
+                    )
                     IconButton(onClick = appState::toggleFullPlayer) {
-                        Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "Minimizar")
+                        Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "Minimizar reproductor a pantalla completa")
                     }
                 }
                 Spacer(Modifier.height(16.dp))
@@ -478,7 +621,7 @@ fun FullPlayerOverlay(appState: DesktopAppState) {
                     ) {
                         ArtworkImage(
                             url = song.thumbnailUrl,
-                            contentDescription = song.title,
+                            contentDescription = "Carátula de ${song.title}",
                             modifier = Modifier.size(340.dp),
                         )
                         Spacer(Modifier.height(20.dp))
@@ -511,3 +654,4 @@ fun FullPlayerOverlay(appState: DesktopAppState) {
         }
     }
 }
+

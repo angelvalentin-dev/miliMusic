@@ -48,6 +48,38 @@ object DesktopPrefKeys {
     val AccountChannelHandle = stringPreferencesKey("accountChannelHandle")
     val YtmSync = booleanPreferencesKey("ytmSync")
 
+    // Advanced playback & queue (keys shared with Android PreferenceKeys.kt)
+    val PersistentQueue = booleanPreferencesKey("persistentQueue")
+    val Autoplay = booleanPreferencesKey("autoplay")
+    val PlaybackSpeed = floatPreferencesKey("desktopPlaybackSpeed")
+    val EqEnabled = booleanPreferencesKey("desktopEqEnabled")
+    val EqPreset = stringPreferencesKey("desktopEqPreset")
+    val EqPreamp = floatPreferencesKey("desktopEqPreamp")
+    val EqBands = stringPreferencesKey("desktopEqBands")
+
+    // Discord RPC (shared keys with Android)
+    val EnableDiscordRPC = booleanPreferencesKey("discordRPCEnable")
+    val DiscordToken = stringPreferencesKey("discordToken")
+    val DiscordUsername = stringPreferencesKey("discordUsername")
+    val DiscordStateTemplate = stringPreferencesKey("discordStateTemplate")
+    val DiscordDetailsTemplate = stringPreferencesKey("discordDetailsTemplate")
+
+    // Last.fm (shared keys with Android)
+    val EnableLastFMScrobbling = booleanPreferencesKey("lastfmScrobblingEnable")
+    val LastFMSession = stringPreferencesKey("lastfmSession")
+    val LastFMUsername = stringPreferencesKey("lastfmUsername")
+    val LastFMUseNowPlaying = booleanPreferencesKey("lastfmUseNowPlaying")
+    val LastFMUseSendLikes = booleanPreferencesKey("lastfmUseSendLikes")
+    val LastFMApiKey = stringPreferencesKey("desktopLastfmApiKey")
+    val LastFMSecret = stringPreferencesKey("desktopLastfmSecret")
+
+    // Listen Together (shared keys with Android)
+    val ListenTogetherServerUrl = stringPreferencesKey("listenTogetherServerUrl")
+    val ListenTogetherUsername = stringPreferencesKey("listenTogetherUsername")
+
+    // Alarms (shared key with Android MusicAlarmStore)
+    val AlarmEntries = stringPreferencesKey("alarmEntries")
+
     // Desktop-specific settings
     val Volume = floatPreferencesKey("desktopVolume")
     val DownloadsDir = stringPreferencesKey("desktopDownloadsDir")
@@ -81,6 +113,28 @@ data class DesktopSettings(
     val accountEmail: String = "",
     val accountChannelHandle: String = "",
     val ytmSync: Boolean = true,
+    val persistentQueue: Boolean = true,
+    val autoplay: Boolean = true,
+    val playbackSpeed: Float = 1.0f,
+    val eqEnabled: Boolean = false,
+    val eqPreset: String = "Flat",
+    val eqPreamp: Float = 0f,
+    val eqBands: List<Float> = List(10) { 0f },
+    val enableDiscordRpc: Boolean = false,
+    val discordToken: String = "",
+    val discordUsername: String = "",
+    val discordStateTemplate: String = "{artist.name}",
+    val discordDetailsTemplate: String = "{song.name}",
+    val enableLastFmScrobbling: Boolean = false,
+    val lastFmSession: String = "",
+    val lastFmUsername: String = "",
+    val lastFmUseNowPlaying: Boolean = true,
+    val lastFmUseSendLikes: Boolean = false,
+    val lastFmApiKey: String = "",
+    val lastFmSecret: String = "",
+    val listenTogetherServerUrl: String = "wss://metroserverx.meowery.eu/ws",
+    val listenTogetherUsername: String = "",
+    val alarmEntriesJson: String = "",
     val volume: Float = 0.85f,
     val downloadsDir: String = AppPaths.defaultDownloadsDir.absolutePath,
     val minimizeToTray: Boolean = true,
@@ -103,6 +157,10 @@ class DesktopPreferences(
 
     val settingsFlow: Flow<DesktopSettings>
         get() = store.data.map { prefs ->
+            val rawBands = prefs[DesktopPrefKeys.EqBands].orEmpty()
+                .split(",")
+                .mapNotNull { it.trim().toFloatOrNull() }
+            val eqBands = if (rawBands.size == 10) rawBands else List(10) { 0f }
             DesktopSettings(
                 darkMode = runCatching {
                     DesktopDarkMode.valueOf(prefs[DesktopPrefKeys.DarkMode] ?: "DARK")
@@ -130,6 +188,28 @@ class DesktopPreferences(
                 accountEmail = prefs[DesktopPrefKeys.AccountEmail] ?: "",
                 accountChannelHandle = prefs[DesktopPrefKeys.AccountChannelHandle] ?: "",
                 ytmSync = prefs[DesktopPrefKeys.YtmSync] ?: true,
+                persistentQueue = prefs[DesktopPrefKeys.PersistentQueue] ?: true,
+                autoplay = prefs[DesktopPrefKeys.Autoplay] ?: true,
+                playbackSpeed = (prefs[DesktopPrefKeys.PlaybackSpeed] ?: 1.0f).coerceIn(0.5f, 2.0f),
+                eqEnabled = prefs[DesktopPrefKeys.EqEnabled] ?: false,
+                eqPreset = prefs[DesktopPrefKeys.EqPreset] ?: "Flat",
+                eqPreamp = (prefs[DesktopPrefKeys.EqPreamp] ?: 0f).coerceIn(-15f, 15f),
+                eqBands = eqBands,
+                enableDiscordRpc = prefs[DesktopPrefKeys.EnableDiscordRPC] ?: false,
+                discordToken = prefs[DesktopPrefKeys.DiscordToken] ?: "",
+                discordUsername = prefs[DesktopPrefKeys.DiscordUsername] ?: "",
+                discordStateTemplate = prefs[DesktopPrefKeys.DiscordStateTemplate] ?: "{artist.name}",
+                discordDetailsTemplate = prefs[DesktopPrefKeys.DiscordDetailsTemplate] ?: "{song.name}",
+                enableLastFmScrobbling = prefs[DesktopPrefKeys.EnableLastFMScrobbling] ?: false,
+                lastFmSession = prefs[DesktopPrefKeys.LastFMSession] ?: "",
+                lastFmUsername = prefs[DesktopPrefKeys.LastFMUsername] ?: "",
+                lastFmUseNowPlaying = prefs[DesktopPrefKeys.LastFMUseNowPlaying] ?: true,
+                lastFmUseSendLikes = prefs[DesktopPrefKeys.LastFMUseSendLikes] ?: false,
+                lastFmApiKey = prefs[DesktopPrefKeys.LastFMApiKey] ?: "",
+                lastFmSecret = prefs[DesktopPrefKeys.LastFMSecret] ?: "",
+                listenTogetherServerUrl = prefs[DesktopPrefKeys.ListenTogetherServerUrl] ?: "wss://metroserverx.meowery.eu/ws",
+                listenTogetherUsername = prefs[DesktopPrefKeys.ListenTogetherUsername] ?: "",
+                alarmEntriesJson = prefs[DesktopPrefKeys.AlarmEntries] ?: "",
                 volume = prefs[DesktopPrefKeys.Volume] ?: 0.85f,
                 downloadsDir = prefs[DesktopPrefKeys.DownloadsDir] ?: AppPaths.defaultDownloadsDir.absolutePath,
                 minimizeToTray = prefs[DesktopPrefKeys.MinimizeToTray] ?: true,

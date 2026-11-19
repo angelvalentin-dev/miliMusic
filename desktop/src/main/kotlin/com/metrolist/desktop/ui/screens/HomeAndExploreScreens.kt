@@ -48,6 +48,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -339,7 +343,10 @@ fun ExploreScreen(appState: DesktopAppState) {
                                             .weight(1f)
                                             .height(52.dp)
                                             .clip(RoundedCornerShape(10.dp))
-                                            .clickable {
+                                            .clickable(
+                                                role = Role.Button,
+                                                onClickLabel = "Explorar estado de ánimo o género ${mood.title}",
+                                            ) {
                                                 appState.navigate(
                                                     NavDestination.Browse(
                                                         browseId = mood.endpoint.browseId,
@@ -455,6 +462,7 @@ fun SearchScreen(
             OutlinedTextField(
                 value = query,
                 onValueChange = { query = it },
+                label = { Text("Buscar música") },
                 placeholder = { Text("Buscar canciones, artistas, álbumes o podcasts...") },
                 leadingIcon = { Icon(Icons.Rounded.Search, null) },
                 trailingIcon = {
@@ -465,7 +473,7 @@ fun SearchScreen(
                             summaryPage = null
                             filteredItems = emptyList()
                         }) {
-                            Icon(Icons.Rounded.Close, "Limpiar")
+                            Icon(Icons.Rounded.Close, "Limpiar búsqueda")
                         }
                     }
                 },
@@ -494,7 +502,10 @@ fun SearchScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(8.dp))
-                                .clickable { executeSearch(s) }
+                                .clickable(
+                                    role = Role.Button,
+                                    onClickLabel = "Buscar sugerencia $s",
+                                ) { executeSearch(s) }
                                 .padding(horizontal = 12.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -514,7 +525,12 @@ fun SearchScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Búsquedas recientes", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text(
+                    text = "Búsquedas recientes",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.semantics { heading() },
+                )
                 TextButton(onClick = { appState.database.clearSearchHistory() }) {
                     Text("Limpiar historial")
                 }
@@ -526,7 +542,10 @@ fun SearchScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
-                            .clickable { executeSearch(item) }
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = "Buscar $item",
+                            ) { executeSearch(item) }
                             .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -534,7 +553,11 @@ fun SearchScreen(
                         Spacer(Modifier.width(10.dp))
                         Text(item, modifier = Modifier.weight(1f))
                         IconButton(onClick = { appState.database.deleteSearchQuery(item) }, modifier = Modifier.size(28.dp)) {
-                            Icon(Icons.Rounded.Close, null, modifier = Modifier.size(16.dp))
+                            Icon(
+                                Icons.Rounded.Close,
+                                contentDescription = "Eliminar $item del historial de búsqueda",
+                                modifier = Modifier.size(16.dp),
+                            )
                         }
                     }
                 }
@@ -565,7 +588,7 @@ fun SearchScreen(
 
         if (loading) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
+                CircularProgressIndicator(modifier = Modifier.semantics { contentDescription = "Buscando resultados" })
             }
             return
         }
@@ -576,7 +599,12 @@ fun SearchScreen(
         ) {
             summaryPage?.summaries?.forEach { section ->
                 item {
-                    Text(section.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = section.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.semantics { heading() },
+                    )
                 }
                 val songs = section.items.filterIsInstance<SongItem>()
                 if (songs.size == section.items.size) {
@@ -614,14 +642,17 @@ fun SearchScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(10.dp))
-                                .clickable {
+                                .clickable(
+                                    role = Role.Button,
+                                    onClickLabel = "Abrir ${item.title}",
+                                ) {
                                     when (item) {
                                         is AlbumItem -> appState.navigate(NavDestination.Album(item.browseId))
                                         is ArtistItem -> appState.navigate(NavDestination.Artist(item.id))
                                         is PlaylistItem -> appState.navigate(NavDestination.Playlist(item.id))
                                         is PodcastItem -> appState.navigate(NavDestination.Podcast(item.id))
                                         is EpisodeItem -> Unit
-                                        else -> Unit
+                                        is SongItem -> Unit
                                     }
                                 }
                                 .padding(10.dp),

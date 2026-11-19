@@ -11,6 +11,7 @@ import com.metrolist.desktop.backup.BackupRestoreService
 import com.metrolist.desktop.data.DesktopPrefKeys
 import com.metrolist.desktop.data.DesktopPreferences
 import com.metrolist.desktop.data.DesktopSettings
+import com.metrolist.desktop.db.DesktopAlarmEntry
 import com.metrolist.desktop.db.DesktopAlbum
 import com.metrolist.desktop.db.DesktopArtist
 import com.metrolist.desktop.db.DesktopDatabase
@@ -20,6 +21,10 @@ import com.metrolist.desktop.db.toDesktopAlbum
 import com.metrolist.desktop.db.toDesktopArtist
 import com.metrolist.desktop.db.toDesktopPlaylist
 import com.metrolist.desktop.db.toDesktopSong
+import com.metrolist.desktop.integrations.DesktopAlarmScheduler
+import com.metrolist.desktop.integrations.DesktopDiscordRpc
+import com.metrolist.desktop.integrations.DesktopLastFmService
+import com.metrolist.desktop.integrations.DesktopListenTogetherManager
 import com.metrolist.desktop.lyrics.DesktopLyricsService
 import com.metrolist.desktop.lyrics.LyricsPayload
 import com.metrolist.desktop.windows.WindowsSmtcManager
@@ -46,6 +51,7 @@ sealed interface NavDestination {
     data object Explore : NavDestination
     data class Search(val query: String = "") : NavDestination
     data class Library(val initialTab: Int = 0) : NavDestination
+    data object Stats : NavDestination
     data class Artist(val artistId: String) : NavDestination
     data class Album(val albumId: String) : NavDestination
     data class Playlist(val playlistId: String, val isLocal: Boolean = false) : NavDestination
@@ -70,13 +76,25 @@ class DesktopAppState {
         qualityProvider = { _settings.value.audioQuality },
         downloadsDirProvider = { File(_settings.value.downloadsDir) },
         cacheEnabledProvider = { _settings.value.enableSongCache },
+        onSongCached = { songId -> database.setCached(songId, true) },
     )
 
     val audioPlayer = DesktopAudioPlayer(
         database = database,
         proxyServer = proxyServer,
         pauseListenHistoryProvider = { _settings.value.pauseListenHistory },
+        autoplayProvider = { _settings.value.autoplay },
+        persistentQueueProvider = { _settings.value.persistentQueue },
         onVolumePersist = { vol -> scope.launch { preferences.set(DesktopPrefKeys.Volume, vol) } },
+        onSpeedPersist = { spd -> scope.launch { preferences.set(DesktopPrefKeys.PlaybackSpeed, spd) } },
+        onEqPersist = { enabled, preset, preamp, bands ->
+            scope.launch {
+                preferences.set(DesktopPrefKeys.EqEnabled, enabled)
+                preferences.set(DesktopPrefKeys.EqPreset, preset)
+                preferences.set(DesktopPrefKeys.EqPreamp, preamp)
+                preferences.set(DesktopPrefKeys.EqBands, bands.joinToString(","))
+            }
+        },
     )
 
     val downloadManager = DownloadManager(
@@ -87,6 +105,19 @@ class DesktopAppState {
     )
 
     val lyricsService = DesktopLyricsService(database)
+
+    val discordRpc = DesktopDiscordRpc(scope)
+    val alarmScheduler = DesktopAlarmScheduler(
+        database = database,
+        audioPlayer = audioPlayer,
+        onStatusMessage = ::showStatus,
+        scope = scope,
+    )
+    val listenTogetherManager = DesktopListenTogetherManager(
+        audioPlayer = audioPlayer,
+        onStatusMessage = ::showStatus,
+        scope = scope,
+    )
 
     val smtcManager = WindowsSmtcManager(
         onPlay = { audioPlayer.resume() },
@@ -104,6 +135,10 @@ class DesktopAppState {
     val librarySongs: StateFlow<List<DesktopSong>> = database.observe { database.librarySongs() }
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
     val downloadedSongs: StateFlow<List<DesktopSong>> = database.observe { database.downloadedSongs() }
+        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+    val topSongs: StateFlow<List<DesktopSong>> = database.observe { database.topSongs(50) }
+        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+    val cachedSongs: StateFlow<List<DesktopSong>> = database.observe { database.cachedSongs() }
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
     val playlists: StateFlow<List<DesktopPlaylist>> = database.observe { database.playlists() }
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -134,6 +169,16 @@ class DesktopAppState {
     private val _showFullPlayer = MutableStateFlow(false)
     val showFullPlayer: StateFlow<Boolean> = _showFullPlayer.asStateFlow()
 
+    // Feature dialogs
+    private val _showEqualizerDialog = MutableStateFlow(false)
+    val showEqualizerDialog: StateFlow<Boolean> = _showEqualizerDialog.asStateFlow()
+    private val _showSleepTimerDialog = MutableStateFlow(false)
+    val showSleepTimerDialog: StateFlow<Boolean> = _showSleepTimerDialog.asStateFlow()
+    private val _showListenTogetherDialog = MutableStateFlow(false)
+    val showListenTogetherDialog: StateFlow<Boolean> = _showListenTogetherDialog.asStateFlow()
+    private val _showWrappedDialog = MutableStateFlow(false)
+    val showWrappedDialog: StateFlow<Boolean> = _showWrappedDialog.asStateFlow()
+
     // Current song lyrics
     private val _currentLyrics = MutableStateFlow<LyricsPayload?>(null)
     val currentLyrics: StateFlow<LyricsPayload?> = _currentLyrics.asStateFlow()
@@ -157,36 +202,90 @@ class DesktopAppState {
             preferences.settingsFlow.collectLatest { st ->
                 _settings.value = st
                 syncInnerTubeSession(st)
+                alarmScheduler.updateFromRawJson(st.alarmEntriesJson)
+                audioPlayer.setPlaybackSpeed(st.playbackSpeed, persist = false)
+                audioPlayer.setEqualizer(
+                    enabled = st.eqEnabled,
+                    preset = st.eqPreset,
+                    preamp = st.eqPreamp,
+                    bands = st.eqBands,
+                    persist = false,
+                )
             }
         }
         scope.launch {
             var lastSongId: String? = null
             var lastPlaying: Boolean? = null
+            var lastDiscordUpdateMs = 0L
+            var scrobbledCurrentSong = false
+            var currentSongStartedEpochSec = 0L
+
             audioPlayer.state.collectLatest { pb ->
                 val song = pb.currentSong
-                if (song?.id != lastSongId) {
+                val st = _settings.value
+                val trackChanged = song?.id != lastSongId
+                val playingChanged = pb.isPlaying != lastPlaying
+
+                if (trackChanged) {
                     lastSongId = song?.id
+                    scrobbledCurrentSong = false
+                    currentSongStartedEpochSec = System.currentTimeMillis() / 1000L
                     if (song != null) {
                         loadLyrics(song)
-                        if (_settings.value.enableSmtc) {
+                        if (st.enableSmtc) {
                             smtcManager.updateMetadata(song.title, song.artistDisplay, song.albumName, song.thumbnailUrl)
+                        }
+                        scope.launch {
+                            runCatching { DesktopLastFmService.updateNowPlaying(song, st) }
                         }
                     } else {
                         _currentLyrics.value = null
                     }
                 }
-                if (pb.isPlaying != lastPlaying && _settings.value.enableSmtc) {
-                    lastPlaying = pb.isPlaying
+                if (playingChanged && st.enableSmtc) {
                     smtcManager.updatePlaybackStatus(pb.isPlaying, song != null)
                 }
-                if (_settings.value.enableSmtc && song != null) {
+                if (trackChanged || playingChanged) {
+                    lastPlaying = pb.isPlaying
+                    listenTogetherManager.broadcastHostPlayback(
+                        song = song,
+                        isPlaying = pb.isPlaying,
+                        positionMs = pb.positionMs,
+                        trackChanged = trackChanged,
+                    )
+                }
+                if (st.enableSmtc && song != null) {
                     smtcManager.updateTimeline(pb.positionMs, pb.durationMs)
+                }
+
+                // Last.fm Scrobble after 50% of duration or 180 seconds (minimum 30s track)
+                if (!scrobbledCurrentSong && song != null && pb.isPlaying) {
+                    val durSec = (pb.durationMs / 1000L).takeIf { it > 0L } ?: song.duration.toLong()
+                    val thresholdMs = if (durSec >= 30L) {
+                        minOf((durSec * 500L), 180_000L).coerceAtLeast(15_000L)
+                    } else {
+                        30_000L
+                    }
+                    if (pb.positionMs >= thresholdMs) {
+                        scrobbledCurrentSong = true
+                        val startedAt = currentSongStartedEpochSec.takeIf { it > 0L } ?: (System.currentTimeMillis() / 1000L)
+                        scope.launch {
+                            runCatching { DesktopLastFmService.scrobble(song, startedAt, st) }
+                        }
+                    }
+                }
+
+                // Discord RPC update on track/play state change or every 15s
+                val now = System.currentTimeMillis()
+                if (trackChanged || playingChanged || (pb.isPlaying && now - lastDiscordUpdateMs >= 15_000L)) {
+                    lastDiscordUpdateMs = now
+                    discordRpc.updatePresence(song, pb.isPlaying, pb.positionMs, pb.durationMs, st)
                 }
             }
         }
         scope.launch {
             preferences.settingsFlow.map { it.volume }.distinctUntilChanged().collectLatest { vol ->
-                audioPlayer.setVolume(vol)
+                audioPlayer.setVolume(vol, persist = false)
             }
         }
     }
@@ -250,6 +349,45 @@ class DesktopAppState {
         _showFullPlayer.value = !_showFullPlayer.value
     }
 
+    fun openEqualizerDialog() {
+        _showEqualizerDialog.value = true
+    }
+
+    fun closeEqualizerDialog() {
+        _showEqualizerDialog.value = false
+    }
+
+    fun openSleepTimerDialog() {
+        _showSleepTimerDialog.value = true
+    }
+
+    fun closeSleepTimerDialog() {
+        _showSleepTimerDialog.value = false
+    }
+
+    fun openListenTogetherDialog() {
+        _showListenTogetherDialog.value = true
+    }
+
+    fun closeListenTogetherDialog() {
+        _showListenTogetherDialog.value = false
+    }
+
+    fun openWrappedDialog() {
+        _showWrappedDialog.value = true
+    }
+
+    fun closeWrappedDialog() {
+        _showWrappedDialog.value = false
+    }
+
+    fun saveAlarms(entries: List<DesktopAlarmEntry>) {
+        scope.launch {
+            val serialized = alarmScheduler.serializeAlarms(entries)
+            preferences.set(DesktopPrefKeys.AlarmEntries, serialized)
+        }
+    }
+
     fun openPlaylistPicker(song: DesktopSong) {
         _playlistPickerSong.value = song
     }
@@ -278,9 +416,9 @@ class DesktopAppState {
         scope.launch {
             val updated = database.toggleLike(song)
             if (_settings.value.isLoggedIn && _settings.value.ytmSync) {
-                val status = if (updated.liked) "LIKE" else "INDIFFERENT"
                 YouTube.likeVideo(updated.id, updated.liked)
             }
+            runCatching { DesktopLastFmService.setLoveStatus(updated, updated.liked, _settings.value) }
         }
     }
 
@@ -383,8 +521,12 @@ class DesktopAppState {
     }
 
     fun shutdown() {
+        alarmScheduler.stop()
+        listenTogetherManager.disconnect()
+        discordRpc.shutdown()
         audioPlayer.release()
         proxyServer.close()
         smtcManager.shutdown()
     }
 }
+

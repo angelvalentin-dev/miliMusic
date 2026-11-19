@@ -20,6 +20,7 @@ class StreamProxyServer(
     private val downloadsDirProvider: () -> File,
     private val cacheEnabledProvider: () -> Boolean,
     private val cacheDirProvider: () -> File = { AppPaths.songCacheDir },
+    private val onSongCached: (String) -> Unit = {},
 ) {
     private val httpClient = OkHttpClient.Builder()
         .followRedirects(true)
@@ -127,7 +128,9 @@ class StreamProxyServer(
                     cacheOut?.flush()
                     cacheOut?.close()
                     if (cacheTemp != null && cacheFinal != null && cacheTemp.exists() && cacheTemp.length() > 0L) {
-                        cacheTemp.renameTo(cacheFinal)
+                        if (cacheTemp.renameTo(cacheFinal)) {
+                            runCatching { onSongCached(videoId) }
+                        }
                     }
                 } catch (_: Throwable) {
                     runCatching { cacheOut?.close() }
@@ -174,7 +177,9 @@ class StreamProxyServer(
             cacheOut?.flush()
             cacheOut?.close()
             if (cacheTemp != null && cacheFinal != null && cacheTemp.exists() && cacheTemp.length() == total) {
-                cacheTemp.renameTo(cacheFinal)
+                if (cacheTemp.renameTo(cacheFinal)) {
+                    runCatching { onSongCached(resolved.videoId) }
+                }
             }
         } catch (_: Throwable) {
             runCatching { cacheOut?.close() }

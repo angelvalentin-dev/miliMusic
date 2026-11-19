@@ -60,6 +60,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -142,13 +145,20 @@ fun YTItemCard(
         is PodcastItem -> item.author?.name ?: "Podcast"
         is EpisodeItem -> item.author?.name ?: "Episodio"
     }
+    val actionVerb = if (item is SongItem || item is EpisodeItem) "Reproducir" else "Abrir"
 
     Surface(
         modifier = modifier
             .width(176.dp)
             .hoverable(interactionSource)
             .clip(RoundedCornerShape(14.dp))
-            .clickable {
+            .semantics(mergeDescendants = true) {
+                contentDescription = "${item.title}, ${subtitle.ifBlank { "YouTube Music" }}"
+            }
+            .clickable(
+                role = Role.Button,
+                onClickLabel = "$actionVerb ${item.title}",
+            ) {
                 when (item) {
                     is SongItem -> appState.audioPlayer.playSong(item.toDesktopSong())
                     is AlbumItem -> appState.navigate(NavDestination.Album(item.browseId))
@@ -173,7 +183,7 @@ fun YTItemCard(
             Box(modifier = Modifier.fillMaxWidth().aspectRatio(1f)) {
                 ArtworkImage(
                     url = item.thumbnail,
-                    contentDescription = item.title,
+                    contentDescription = null,
                     isCircle = isArtist,
                     modifier = Modifier.fillMaxSize(),
                 )
@@ -186,7 +196,10 @@ fun YTItemCard(
                             .align(Alignment.BottomEnd)
                             .padding(8.dp)
                             .size(40.dp)
-                            .clickable {
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = "Reproducir ${item.title}",
+                            ) {
                                 when (item) {
                                     is SongItem -> appState.audioPlayer.playSong(item.toDesktopSong())
                                     is EpisodeItem -> appState.audioPlayer.playSong(
@@ -201,14 +214,14 @@ fun YTItemCard(
                                     is AlbumItem -> appState.navigate(NavDestination.Album(item.browseId))
                                     is PlaylistItem -> appState.navigate(NavDestination.Playlist(item.id, isLocal = false))
                                     is PodcastItem -> appState.navigate(NavDestination.Podcast(item.id))
-                                    else -> Unit
+                                    is ArtistItem -> Unit
                                 }
                             },
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
                                 Icons.Rounded.PlayArrow,
-                                contentDescription = "Reproducir",
+                                contentDescription = "Reproducir ${item.title}",
                                 tint = MaterialTheme.colorScheme.onPrimary,
                             )
                         }
@@ -259,7 +272,11 @@ fun SongRowItem(
             .fillMaxWidth()
             .hoverable(interactionSource)
             .clip(RoundedCornerShape(10.dp))
-            .clickable(onClick = onPlay),
+            .clickable(
+                role = Role.Button,
+                onClickLabel = "Reproducir ${song.title} de ${song.artistDisplay}",
+                onClick = onPlay,
+            ),
         color = when {
             isCurrent -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
             hovered -> MaterialTheme.colorScheme.surfaceContainerHigh
@@ -276,7 +293,7 @@ fun SongRowItem(
                     if (hovered) {
                         Icon(
                             Icons.Rounded.PlayArrow,
-                            contentDescription = "Reproducir",
+                            contentDescription = "Reproducir ${song.title}",
                             tint = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(20.dp),
                         )
@@ -293,7 +310,7 @@ fun SongRowItem(
 
             ArtworkImage(
                 url = song.thumbnailUrl,
-                contentDescription = song.title,
+                contentDescription = null,
                 modifier = Modifier.size(44.dp),
             )
             Spacer(Modifier.width(12.dp))
@@ -322,7 +339,7 @@ fun SongRowItem(
             IconButton(onClick = { appState.toggleLike(song) }, modifier = Modifier.size(34.dp)) {
                 Icon(
                     imageVector = if (isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                    contentDescription = "Me gusta",
+                    contentDescription = if (isLiked) "Quitar ${song.title} de Me gusta" else "Añadir ${song.title} a Me gusta",
                     tint = if (isLiked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(18.dp),
                 )
@@ -333,7 +350,11 @@ fun SongRowItem(
                     downloadProgress != null -> {
                         CircularProgressIndicator(
                             progress = { downloadProgress },
-                            modifier = Modifier.size(20.dp),
+                            modifier = Modifier
+                                .size(20.dp)
+                                .semantics {
+                                    contentDescription = "Descargando ${song.title}: ${(downloadProgress * 100).toInt()} por ciento"
+                                },
                             strokeWidth = 2.dp,
                         )
                     }
@@ -344,7 +365,7 @@ fun SongRowItem(
                         ) {
                             Icon(
                                 Icons.Rounded.CheckCircle,
-                                contentDescription = "Descargada",
+                                contentDescription = "Descargada: eliminar descarga de ${song.title}",
                                 tint = MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.size(18.dp),
                             )
@@ -357,7 +378,7 @@ fun SongRowItem(
                         ) {
                             Icon(
                                 Icons.Rounded.Download,
-                                contentDescription = "Descargar",
+                                contentDescription = "Descargar ${song.title}",
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(18.dp),
                             )
@@ -377,7 +398,7 @@ fun SongRowItem(
                 IconButton(onClick = { menuExpanded = true }, modifier = Modifier.size(32.dp)) {
                     Icon(
                         Icons.Rounded.MoreVert,
-                        contentDescription = "Opciones",
+                        contentDescription = "Más opciones para ${song.title}",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(18.dp),
                     )
@@ -486,7 +507,10 @@ fun AddToPlaylistDialog(appState: DesktopAppState) {
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(8.dp))
-                                .clickable {
+                                .clickable(
+                                    role = Role.Button,
+                                    onClickLabel = "Añadir ${song.title} a ${pl.name}",
+                                ) {
                                     appState.database.addSongToPlaylist(pl.id, song)
                                     appState.showStatus("Añadida a ${pl.name}")
                                     appState.closePlaylistPicker()

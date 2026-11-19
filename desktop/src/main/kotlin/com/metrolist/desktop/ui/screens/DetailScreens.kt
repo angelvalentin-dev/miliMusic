@@ -44,6 +44,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.metrolist.desktop.db.ArtistRef
@@ -83,7 +86,9 @@ fun ArtistScreen(artistId: String, appState: DesktopAppState) {
     }
 
     if (loading) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(modifier = Modifier.semantics { contentDescription = "Cargando artista" })
+        }
         return
     }
     val data = page ?: run {
@@ -100,7 +105,12 @@ fun ArtistScreen(artistId: String, appState: DesktopAppState) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(20.dp)) {
                 ArtworkImage(data.artist.thumbnail, data.artist.title, isCircle = true, modifier = Modifier.size(140.dp))
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(data.artist.title, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = data.artist.title,
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.semantics { heading() },
+                    )
                     data.subscriberCountText?.let {
                         Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }

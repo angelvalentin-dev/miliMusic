@@ -57,6 +57,12 @@ import androidx.compose.ui.input.key.isAltPressed
 import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpSize
@@ -79,13 +85,19 @@ import com.metrolist.desktop.ui.components.RightSidePanel
 import com.metrolist.desktop.ui.screens.AlbumScreen
 import com.metrolist.desktop.ui.screens.ArtistScreen
 import com.metrolist.desktop.ui.screens.BrowseScreen
+import com.metrolist.desktop.ui.screens.EqualizerAndSpeedDialog
 import com.metrolist.desktop.ui.screens.ExploreScreen
 import com.metrolist.desktop.ui.screens.HomeScreen
 import com.metrolist.desktop.ui.screens.LibraryScreen
+import com.metrolist.desktop.ui.screens.ListenTogetherDialog
 import com.metrolist.desktop.ui.screens.PlaylistScreen
 import com.metrolist.desktop.ui.screens.PodcastScreen
 import com.metrolist.desktop.ui.screens.SearchScreen
 import com.metrolist.desktop.ui.screens.SettingsScreen
+import com.metrolist.desktop.ui.screens.SleepTimerDialog
+import com.metrolist.desktop.ui.screens.StatsScreen
+import com.metrolist.desktop.ui.screens.WrappedDialog
+import com.metrolist.desktop.ui.icons.History
 import com.metrolist.desktop.ui.theme.DefaultThemeColor
 import com.metrolist.desktop.ui.theme.MiliMusicDesktopTheme
 import com.metrolist.desktop.ui.theme.rememberArtworkSeedColor
@@ -162,6 +174,10 @@ fun main() = application {
                     }
                     event.isCtrlPressed && event.key == Key.Q -> {
                         appState.toggleQueuePanel()
+                        true
+                    }
+                    event.isCtrlPressed && event.key == Key.E -> {
+                        appState.openEqualizerDialog()
                         true
                     }
                     event.isCtrlPressed && event.key == Key.DirectionRight -> {
@@ -245,7 +261,12 @@ private fun DesktopShell(appState: DesktopAppState) {
     }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHost) },
+        snackbarHost = {
+            SnackbarHost(
+                hostState = snackbarHost,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+        },
         bottomBar = { DesktopPlayerBar(appState) },
     ) { innerPadding ->
         Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
@@ -253,7 +274,10 @@ private fun DesktopShell(appState: DesktopAppState) {
                 // Left sidebar
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceContainerLow,
-                    modifier = Modifier.width(236.dp).fillMaxHeight(),
+                    modifier = Modifier
+                        .width(236.dp)
+                        .fillMaxHeight()
+                        .semantics { contentDescription = "Menú de navegación principal" },
                 ) {
                     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
                         Row(
@@ -265,6 +289,7 @@ private fun DesktopShell(appState: DesktopAppState) {
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.ExtraBold,
                                 color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.semantics { heading() },
                             )
                         }
 
@@ -299,6 +324,12 @@ private fun DesktopShell(appState: DesktopAppState) {
                             label = { Text("Descargas") },
                         )
                         NavigationDrawerItem(
+                            selected = currentDest is NavDestination.Stats,
+                            onClick = { appState.navigate(NavDestination.Stats) },
+                            icon = { Icon(Icons.Rounded.History, null) },
+                            label = { Text("Estadísticas") },
+                        )
+                        NavigationDrawerItem(
                             selected = currentDest is NavDestination.Settings,
                             onClick = { appState.navigate(NavDestination.Settings) },
                             icon = { Icon(Icons.Rounded.Settings, null) },
@@ -313,7 +344,9 @@ private fun DesktopShell(appState: DesktopAppState) {
                             text = "PLAYLISTS",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                            modifier = Modifier
+                                .padding(horizontal = 12.dp, vertical = 4.dp)
+                                .semantics { heading() },
                         )
 
                         LazyColumn(
@@ -325,7 +358,10 @@ private fun DesktopShell(appState: DesktopAppState) {
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clip(RoundedCornerShape(8.dp))
-                                        .clickable {
+                                        .clickable(
+                                            role = Role.Button,
+                                            onClickLabel = "Abrir playlist ${pl.name}",
+                                        ) {
                                             appState.navigate(NavDestination.Playlist(pl.id, isLocal = pl.isLocal))
                                         }
                                         .padding(horizontal = 12.dp, vertical = 8.dp),
@@ -371,10 +407,10 @@ private fun DesktopShell(appState: DesktopAppState) {
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                 IconButton(enabled = canGoBack, onClick = appState::goBack) {
-                                    Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Atrás")
+                                    Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Navegar atrás (Alt+Izquierda)")
                                 }
                                 IconButton(enabled = canGoForward, onClick = appState::goForward) {
-                                    Icon(Icons.AutoMirrored.Rounded.ArrowForward, contentDescription = "Adelante")
+                                    Icon(Icons.AutoMirrored.Rounded.ArrowForward, contentDescription = "Navegar adelante (Alt+Derecha)")
                                 }
                                 Spacer(Modifier.width(8.dp))
                                 Surface(
@@ -384,7 +420,10 @@ private fun DesktopShell(appState: DesktopAppState) {
                                         .width(340.dp)
                                         .height(38.dp)
                                         .clip(RoundedCornerShape(20.dp))
-                                        .clickable { appState.navigate(NavDestination.Search()) },
+                                        .clickable(
+                                            role = Role.Button,
+                                            onClickLabel = "Abrir búsqueda de música (Ctrl+F)",
+                                        ) { appState.navigate(NavDestination.Search()) },
                                 ) {
                                     Row(
                                         modifier = Modifier.padding(horizontal = 14.dp),
@@ -406,17 +445,29 @@ private fun DesktopShell(appState: DesktopAppState) {
                                 }
                             }
 
-                            if (settings.isLoggedIn) {
-                                OutlinedButton(onClick = { appState.navigate(NavDestination.Settings) }) {
-                                    Icon(Icons.Rounded.Person, null, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(settings.accountName.ifBlank { "Cuenta YTM" }, maxLines = 1)
+                            val ltState by appState.listenTogetherManager.state.collectAsState()
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = appState::openListenTogetherDialog) {
+                                    Text(
+                                        text = if (ltState.roomCode.isNotBlank()) "Sala: ${ltState.roomCode}" else "Escuchar juntos",
+                                        maxLines = 1,
+                                    )
                                 }
-                            } else {
-                                OutlinedButton(onClick = appState::openLoginDialog) {
-                                    Icon(Icons.Rounded.Person, null, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("Iniciar sesión")
+                                OutlinedButton(onClick = appState::openWrappedDialog) {
+                                    Text("Wrapped ✨", maxLines = 1)
+                                }
+                                if (settings.isLoggedIn) {
+                                    OutlinedButton(onClick = { appState.navigate(NavDestination.Settings) }) {
+                                        Icon(Icons.Rounded.Person, null, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(settings.accountName.ifBlank { "Cuenta YTM" }, maxLines = 1)
+                                    }
+                                } else {
+                                    OutlinedButton(onClick = appState::openLoginDialog) {
+                                        Icon(Icons.Rounded.Person, null, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Iniciar sesión")
+                                    }
                                 }
                             }
                         }
@@ -430,6 +481,7 @@ private fun DesktopShell(appState: DesktopAppState) {
                             NavDestination.Explore -> ExploreScreen(appState)
                             is NavDestination.Search -> SearchScreen(d.query, appState)
                             is NavDestination.Library -> LibraryScreen(d.initialTab, appState)
+                            NavDestination.Stats -> StatsScreen(appState)
                             is NavDestination.Artist -> ArtistScreen(d.artistId, appState)
                             is NavDestination.Album -> AlbumScreen(d.albumId, appState)
                             is NavDestination.Playlist -> PlaylistScreen(d.playlistId, d.isLocal, appState)
@@ -450,4 +502,8 @@ private fun DesktopShell(appState: DesktopAppState) {
 
     AddToPlaylistDialog(appState)
     LoginDialog(appState)
+    EqualizerAndSpeedDialog(appState)
+    SleepTimerDialog(appState)
+    ListenTogetherDialog(appState)
+    WrappedDialog(appState)
 }

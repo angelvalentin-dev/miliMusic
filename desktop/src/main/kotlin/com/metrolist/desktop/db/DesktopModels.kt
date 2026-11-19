@@ -5,11 +5,13 @@ import com.metrolist.innertube.models.ArtistItem
 import com.metrolist.innertube.models.PlaylistItem
 import com.metrolist.innertube.models.SongItem
 
+@kotlinx.serialization.Serializable
 data class ArtistRef(
     val id: String,
     val name: String,
 )
 
+@kotlinx.serialization.Serializable
 data class DesktopSong(
     val id: String,
     val title: String,
@@ -69,6 +71,43 @@ data class DesktopPlaylist(
 data class DesktopLyricsEntry(
     val timeMs: Long,
     val text: String,
+)
+
+data class DesktopSongStat(
+    val song: DesktopSong,
+    val playCount: Int,
+    val playTimeMs: Long,
+)
+
+data class DesktopArtistStat(
+    val artist: DesktopArtist,
+    val playCount: Int,
+    val playTimeMs: Long,
+)
+
+data class DesktopAlbumStat(
+    val album: DesktopAlbum,
+    val playCount: Int,
+    val playTimeMs: Long,
+)
+
+data class ListeningSummary(
+    val totalPlayTimeMs: Long = 0L,
+    val totalPlays: Int = 0,
+    val uniqueSongs: Int = 0,
+    val uniqueArtists: Int = 0,
+    val uniqueAlbums: Int = 0,
+)
+
+@kotlinx.serialization.Serializable
+data class DesktopAlarmEntry(
+    val id: String,
+    val enabled: Boolean = true,
+    val hour: Int = 7,
+    val minute: Int = 0,
+    val playlistId: String = "TOP",
+    val randomSong: Boolean = false,
+    val nextTriggerAt: Long = -1L,
 )
 
 fun SongItem.toDesktopSong(): DesktopSong =

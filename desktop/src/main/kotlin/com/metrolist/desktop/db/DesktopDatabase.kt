@@ -187,6 +187,26 @@ class DesktopDatabase(
                 }
             }
         }
+
+        if (!song.albumId.isNullOrBlank() && !song.albumName.isNullOrBlank()) {
+            conn.prepareStatement(
+                """
+                INSERT INTO album (id, title, thumbnailUrl, songCount, duration, explicit, lastUpdateTime)
+                VALUES (?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = COALESCE(album.title, excluded.title),
+                    thumbnailUrl = COALESCE(album.thumbnailUrl, excluded.thumbnailUrl)
+                """.trimIndent(),
+            ).use { ps ->
+                ps.setString(1, song.albumId)
+                ps.setString(2, song.albumName)
+                ps.setString(3, song.thumbnailUrl)
+                ps.setInt(4, song.duration.coerceAtLeast(0))
+                ps.setInt(5, if (song.explicit) 1 else 0)
+                ps.setLong(6, now)
+                ps.executeUpdate()
+            }
+        }
     }
 
     fun toggleLike(song: DesktopSong): DesktopSong {
@@ -273,8 +293,24 @@ class DesktopDatabase(
         notifyChanged()
     }
 
-    fun recordPlay(song: DesktopSong, playedMs: Long) {
-        val now = System.currentTimeMillis()
+    fun setCached(songId: String, cached: Boolean) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("UPDATE song SET isCached = ? WHERE id = ?").use { ps ->
+                    ps.setInt(1, if (cached) 1 else 0)
+                    ps.setString(2, songId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun recordPlay(song: DesktopSong, playedMs: Long, timestampMs: Long = System.currentTimeMillis()) {
+        val safePlayMs = playedMs.coerceAtLeast(1000L)
+        val cal = java.util.Calendar.getInstance().apply { timeInMillis = timestampMs }
+        val year = cal.get(java.util.Calendar.YEAR)
+        val month = cal.get(java.util.Calendar.MONTH) + 1
         synchronized(dbLock) {
             openConnection().use { conn ->
                 conn.autoCommit = false
@@ -284,15 +320,26 @@ class DesktopDatabase(
                         "INSERT INTO event (songId, timestamp, playTime) VALUES (?, ?, ?)",
                     ).use { ps ->
                         ps.setString(1, song.id)
-                        ps.setLong(2, now)
-                        ps.setLong(3, playedMs.coerceAtLeast(1000L))
+                        ps.setLong(2, timestampMs)
+                        ps.setLong(3, safePlayMs)
                         ps.executeUpdate()
                     }
                     conn.prepareStatement(
                         "UPDATE song SET totalPlayTime = totalPlayTime + ? WHERE id = ?",
                     ).use { ps ->
-                        ps.setLong(1, playedMs.coerceAtLeast(1000L))
+                        ps.setLong(1, safePlayMs)
                         ps.setString(2, song.id)
+                        ps.executeUpdate()
+                    }
+                    conn.prepareStatement(
+                        """
+                        INSERT INTO playCount (song, year, month, count) VALUES (?, ?, ?, 1)
+                        ON CONFLICT(song, year, month) DO UPDATE SET count = playCount.count + 1
+                        """.trimIndent(),
+                    ).use { ps ->
+                        ps.setString(1, song.id)
+                        ps.setInt(2, year)
+                        ps.setInt(3, month)
                         ps.executeUpdate()
                     }
                     conn.commit()
@@ -308,6 +355,31 @@ class DesktopDatabase(
     fun likedSongs(): List<DesktopSong> = querySongs("WHERE liked = 1 ORDER BY COALESCE(likedDate, 0) DESC, title ASC")
     fun librarySongs(): List<DesktopSong> = querySongs("WHERE inLibrary IS NOT NULL ORDER BY inLibrary DESC, title ASC")
     fun downloadedSongs(): List<DesktopSong> = querySongs("WHERE isDownloaded = 1 ORDER BY COALESCE(dateDownload, 0) DESC, title ASC")
+    fun topSongs(limit: Int = 50): List<DesktopSong> =
+        mostPlayedSongs(sinceMs = 0L, limit = limit).map { it.song }
+
+    fun cachedSongs(cacheDir: File = AppPaths.songCacheDir): List<DesktopSong> = synchronized(dbLock) {
+        val fileIds = cacheDir.listFiles()
+            ?.filter { it.isFile && it.extension == "cache" && it.length() > 0L }
+            ?.map { it.nameWithoutExtension }
+            .orEmpty()
+            .toSet()
+        openConnection().use { conn ->
+            conn.prepareStatement("SELECT * FROM song ORDER BY COALESCE(dateModified, 0) DESC").use { ps ->
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            val id = rs.getString("id")
+                            val isCachedCol = rs.getInt("isCached") != 0
+                            if (isCachedCol || id in fileIds) {
+                                add(readSong(conn, rs))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fun recentlyPlayed(limit: Int = 50): List<DesktopSong> = synchronized(dbLock) {
         openConnection().use { conn ->
@@ -324,6 +396,176 @@ class DesktopDatabase(
                 ps.executeQuery().use { rs ->
                     buildList {
                         while (rs.next()) add(readSong(conn, rs))
+                    }
+                }
+            }
+        }
+    }
+
+    fun mostPlayedSongs(
+        sinceMs: Long = 0L,
+        untilMs: Long = Long.MAX_VALUE,
+        limit: Int = 50,
+    ): List<DesktopSongStat> = synchronized(dbLock) {
+        openConnection().use { conn ->
+            val sql = """
+                SELECT s.*, COUNT(e.id) AS playCount, COALESCE(SUM(e.playTime), 0) AS sumPlayTime
+                FROM event e
+                JOIN song s ON s.id = e.songId
+                WHERE e.timestamp >= ? AND e.timestamp <= ?
+                GROUP BY s.id
+                ORDER BY sumPlayTime DESC, playCount DESC
+                LIMIT ?
+            """.trimIndent()
+            conn.prepareStatement(sql).use { ps ->
+                ps.setLong(1, sinceMs)
+                ps.setLong(2, untilMs)
+                ps.setInt(3, limit)
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopSongStat(
+                                    song = readSong(conn, rs),
+                                    playCount = rs.getInt("playCount"),
+                                    playTimeMs = rs.getLong("sumPlayTime"),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun mostPlayedArtists(
+        sinceMs: Long = 0L,
+        untilMs: Long = Long.MAX_VALUE,
+        limit: Int = 30,
+    ): List<DesktopArtistStat> = synchronized(dbLock) {
+        openConnection().use { conn ->
+            val sql = """
+                SELECT a.id, a.name, a.thumbnailUrl, a.channelId, a.bookmarkedAt,
+                       COUNT(e.id) AS playCount, COALESCE(SUM(e.playTime), 0) AS sumPlayTime,
+                       MAX(s.thumbnailUrl) AS fallbackThumb
+                FROM event e
+                JOIN song_artist_map m ON m.songId = e.songId
+                JOIN artist a ON a.id = m.artistId
+                LEFT JOIN song s ON s.id = e.songId
+                WHERE e.timestamp >= ? AND e.timestamp <= ?
+                GROUP BY a.id
+                ORDER BY sumPlayTime DESC, playCount DESC
+                LIMIT ?
+            """.trimIndent()
+            conn.prepareStatement(sql).use { ps ->
+                ps.setLong(1, sinceMs)
+                ps.setLong(2, untilMs)
+                ps.setInt(3, limit)
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopArtistStat(
+                                    artist = DesktopArtist(
+                                        id = rs.getString("id"),
+                                        name = rs.getString("name"),
+                                        thumbnailUrl = rs.getString("thumbnailUrl") ?: rs.getString("fallbackThumb"),
+                                        channelId = rs.getString("channelId"),
+                                        bookmarkedAt = rs.getObject("bookmarkedAt")?.let { (it as Number).toLong() },
+                                    ),
+                                    playCount = rs.getInt("playCount"),
+                                    playTimeMs = rs.getLong("sumPlayTime"),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun mostPlayedAlbums(
+        sinceMs: Long = 0L,
+        untilMs: Long = Long.MAX_VALUE,
+        limit: Int = 30,
+    ): List<DesktopAlbumStat> = synchronized(dbLock) {
+        openConnection().use { conn ->
+            val sql = """
+                SELECT s.albumId AS aid,
+                       COALESCE(al.title, s.albumName) AS atitle,
+                       COALESCE(al.thumbnailUrl, MAX(s.thumbnailUrl)) AS athumb,
+                       al.year AS ayear,
+                       COUNT(e.id) AS playCount,
+                       COALESCE(SUM(e.playTime), 0) AS sumPlayTime
+                FROM event e
+                JOIN song s ON s.id = e.songId
+                LEFT JOIN album al ON al.id = s.albumId
+                WHERE e.timestamp >= ? AND e.timestamp <= ?
+                  AND s.albumId IS NOT NULL AND s.albumId != ''
+                GROUP BY s.albumId
+                ORDER BY sumPlayTime DESC, playCount DESC
+                LIMIT ?
+            """.trimIndent()
+            conn.prepareStatement(sql).use { ps ->
+                ps.setLong(1, sinceMs)
+                ps.setLong(2, untilMs)
+                ps.setInt(3, limit)
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            val albumId = rs.getString("aid") ?: continue
+                            val title = rs.getString("atitle") ?: "Álbum"
+                            add(
+                                DesktopAlbumStat(
+                                    album = DesktopAlbum(
+                                        id = albumId,
+                                        title = title,
+                                        year = rs.getObject("ayear")?.let { (it as Number).toInt() },
+                                        thumbnailUrl = rs.getString("athumb"),
+                                    ),
+                                    playCount = rs.getInt("playCount"),
+                                    playTimeMs = rs.getLong("sumPlayTime"),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun listeningSummary(
+        sinceMs: Long = 0L,
+        untilMs: Long = Long.MAX_VALUE,
+    ): ListeningSummary = synchronized(dbLock) {
+        openConnection().use { conn ->
+            val sql = """
+                SELECT COALESCE(SUM(e.playTime), 0) AS totalTime,
+                       COUNT(e.id) AS totalPlays,
+                       COUNT(DISTINCT e.songId) AS uniqueSongs,
+                       (SELECT COUNT(DISTINCT m.artistId) FROM event e2 JOIN song_artist_map m ON m.songId = e2.songId WHERE e2.timestamp >= ? AND e2.timestamp <= ?) AS uniqueArtists,
+                       (SELECT COUNT(DISTINCT s2.albumId) FROM event e3 JOIN song s2 ON s2.id = e3.songId WHERE e3.timestamp >= ? AND e3.timestamp <= ? AND s2.albumId IS NOT NULL AND s2.albumId != '') AS uniqueAlbums
+                FROM event e
+                WHERE e.timestamp >= ? AND e.timestamp <= ?
+            """.trimIndent()
+            conn.prepareStatement(sql).use { ps ->
+                ps.setLong(1, sinceMs)
+                ps.setLong(2, untilMs)
+                ps.setLong(3, sinceMs)
+                ps.setLong(4, untilMs)
+                ps.setLong(5, sinceMs)
+                ps.setLong(6, untilMs)
+                ps.executeQuery().use { rs ->
+                    if (rs.next()) {
+                        ListeningSummary(
+                            totalPlayTimeMs = rs.getLong("totalTime"),
+                            totalPlays = rs.getInt("totalPlays"),
+                            uniqueSongs = rs.getInt("uniqueSongs"),
+                            uniqueArtists = rs.getInt("uniqueArtists"),
+                            uniqueAlbums = rs.getInt("uniqueAlbums"),
+                        )
+                    } else {
+                        ListeningSummary()
                     }
                 }
             }

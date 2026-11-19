@@ -195,4 +195,103 @@ class DesktopCoreTests {
             proxy.close()
         }
     }
+
+    @Test
+    fun `statistics queries and auto-playlists aggregate plays, artists, albums, and cached songs`() {
+        val dbFile = tempFolder.newFile("stats.db").apply { delete() }
+        val cacheDir = tempFolder.newFolder("song_cache")
+        val db = DesktopDatabase(dbFile)
+
+        val song1 = DesktopSong(
+            id = "s1",
+            title = "Alpha Song",
+            duration = 200,
+            albumId = "alb1",
+            albumName = "Alpha Album",
+            artists = listOf(ArtistRef("art1", "Alpha Artist")),
+        )
+        val song2 = DesktopSong(
+            id = "s2",
+            title = "Beta Song",
+            duration = 180,
+            albumId = "alb2",
+            albumName = "Beta Album",
+            artists = listOf(ArtistRef("art2", "Beta Artist")),
+        )
+
+        db.recordPlay(song1, 180_000L)
+        db.recordPlay(song1, 120_000L)
+        db.recordPlay(song2, 90_000L)
+
+        val summary = db.listeningSummary(0L)
+        assertEquals(390_000L, summary.totalPlayTimeMs)
+        assertEquals(3, summary.totalPlays)
+        assertEquals(2, summary.uniqueSongs)
+        assertEquals(2, summary.uniqueArtists)
+        assertEquals(2, summary.uniqueAlbums)
+
+        val topSongs = db.mostPlayedSongs(0L)
+        assertEquals(2, topSongs.size)
+        assertEquals("s1", topSongs[0].song.id)
+        assertEquals(2, topSongs[0].playCount)
+        assertEquals(300_000L, topSongs[0].playTimeMs)
+
+        val topArtists = db.mostPlayedArtists(0L)
+        assertEquals("art1", topArtists[0].artist.id)
+        assertEquals(2, topArtists[0].playCount)
+
+        val topAlbums = db.mostPlayedAlbums(0L)
+        assertEquals("alb1", topAlbums[0].album.id)
+        assertEquals("Alpha Album", topAlbums[0].album.title)
+
+        File(cacheDir, "s2.cache").writeBytes("cached-audio".toByteArray())
+        val cached = db.cachedSongs(cacheDir)
+        assertEquals(listOf("s2"), cached.map { it.id })
+    }
+
+    @Test
+    fun `listen together proto3 codec, lastfm md5, and alarm json round-trip accurately`() {
+        val track = com.metrolist.desktop.integrations.LtTrackInfo(
+            id = "vid999",
+            title = "Proto Track",
+            artist = "Proto Artist",
+            album = "Proto Album",
+            duration = 215_000L,
+            thumbnail = "https://example.com/t.jpg",
+        )
+        val actionPayload = com.metrolist.desktop.integrations.ListenTogetherProtoCodec.encodePlaybackAction(
+            action = "change_track",
+            trackId = track.id,
+            positionMs = 42_000L,
+            trackInfo = track,
+            revision = 7L,
+        )
+        val env = com.metrolist.desktop.integrations.ListenTogetherProtoCodec.encodeEnvelope("sync_playback", actionPayload, compress = true)
+        val (decodedType, decodedBytes) = com.metrolist.desktop.integrations.ListenTogetherProtoCodec.decodeEnvelope(env)
+        assertEquals("sync_playback", decodedType)
+        val decodedAction = com.metrolist.desktop.integrations.ListenTogetherProtoCodec.decodePlaybackAction(decodedBytes)
+        assertEquals("change_track", decodedAction.action)
+        assertEquals("vid999", decodedAction.trackId)
+        assertEquals(42_000L, decodedAction.positionMs)
+        assertEquals("Proto Track", decodedAction.trackInfo?.title)
+        assertEquals(215_000L, decodedAction.trackInfo?.duration)
+
+        val sig = com.metrolist.desktop.integrations.DesktopLastFmService.md5Sig(
+            mapOf("method" to "auth.getToken", "api_key" to "testKey"),
+            "secret123",
+        )
+        assertEquals(32, sig.length)
+
+        val rawAlarms = """[{"id":"a1","enabled":true,"hour":8,"minute":30,"playlistId":"TOP","randomSong":true,"nextTriggerAt":-1}]"""
+        val parsed = com.metrolist.desktop.integrations.DesktopAlarmScheduler.parseAlarms(rawAlarms)
+        assertEquals(1, parsed.size)
+        assertEquals(8, parsed[0].hour)
+        assertEquals(30, parsed[0].minute)
+        assertTrue(parsed[0].randomSong)
+        val roundTripped = com.metrolist.desktop.integrations.DesktopAlarmScheduler.parseAlarms(
+            com.metrolist.desktop.integrations.DesktopAlarmScheduler.serializeAlarms(parsed),
+        )
+        assertEquals(parsed, roundTripped)
+    }
 }
+
