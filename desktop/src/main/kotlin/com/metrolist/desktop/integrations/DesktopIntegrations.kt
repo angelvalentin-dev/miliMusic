@@ -163,6 +163,12 @@ object DesktopLastFmService {
             extra = mapOf("artist" to song.artistDisplay, "track" to song.title),
         )
     }
+
+    fun close() {
+        runCatching { httpClient.dispatcher.cancelAll() }
+        runCatching { httpClient.dispatcher.executorService.shutdownNow() }
+        runCatching { httpClient.connectionPool.evictAll() }
+    }
 }
 
 class DesktopDiscordRpc(
@@ -497,8 +503,10 @@ class DesktopDiscordRpc(
     }
 
     fun shutdown() {
-        clearPresence()
         closeGateway()
+        runCatching { httpClient.dispatcher.cancelAll() }
+        runCatching { httpClient.dispatcher.executorService.shutdownNow() }
+        runCatching { httpClient.connectionPool.evictAll() }
     }
 }
 

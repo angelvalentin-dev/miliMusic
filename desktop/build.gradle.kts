@@ -20,14 +20,13 @@ dependencies {
     implementation(project(":innertube"))
 
     implementation(compose.desktop.currentOs)
-    implementation(compose.material3)
+    implementation(libs.compose.material3)
     implementation(compose.foundation)
     implementation(compose.runtime)
     implementation(compose.ui)
     implementation(compose.animation)
     implementation(libs.compose.icons.core)
     implementation(libs.materialKolor)
-    implementation(libs.compose.reorderable)
 
     implementation(libs.coil)
     implementation(libs.coil.network.okhttp)

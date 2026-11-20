@@ -293,5 +293,96 @@ class DesktopCoreTests {
         )
         assertEquals(parsed, roundTripped)
     }
+
+    @Test
+    fun `single instance guard blocks duplicate launch, signals primary window, and releases on close`() {
+        val lockDir = tempFolder.newFolder("instance_lock")
+        val activated = java.util.concurrent.CountDownLatch(1)
+
+        val primary = SingleInstanceGuard.tryAcquire(lockDir) { activated.countDown() }
+        assertNotNull("Primary instance should acquire lock", primary)
+
+        val duplicate = SingleInstanceGuard.tryAcquire(lockDir)
+        assertNull("Duplicate instance must not acquire lock", duplicate)
+        assertTrue("Primary instance should receive SHOW activation", activated.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+        primary!!.close()
+        val reacquired = SingleInstanceGuard.tryAcquire(lockDir)
+        assertNotNull("Lock must be released cleanly after close", reacquired)
+        reacquired!!.close()
+    }
+
+    @Test
+    fun `stream proxy handles HEAD and out-of-range requests safely`() {
+        val downloadsDir = tempFolder.newFolder("downloads_head")
+        val cacheDir = tempFolder.newFolder("cache_head")
+        File(downloadsDir, "head1.m4a").writeBytes("0123456789".toByteArray())
+
+        val proxy = StreamProxyServer(
+            resolver = InnerTubeStreamResolver(),
+            qualityProvider = { DesktopAudioQuality.HIGH },
+            downloadsDirProvider = { downloadsDir },
+            cacheEnabledProvider = { false },
+            cacheDirProvider = { cacheDir },
+        )
+        try {
+            val url = URI(proxy.streamUrlFor("head1")).toURL()
+
+            val headConn = (url.openConnection() as HttpURLConnection).apply { requestMethod = "HEAD" }
+            assertEquals(200, headConn.responseCode)
+            assertEquals("10", headConn.getHeaderField("Content-Length"))
+            headConn.disconnect()
+
+            val badRange = url.openConnection() as HttpURLConnection
+            badRange.setRequestProperty("Range", "bytes=99-120")
+            assertEquals(416, badRange.responseCode)
+            badRange.disconnect()
+        } finally {
+            proxy.close()
+        }
+    }
+
+    @OptIn(androidx.compose.ui.InternalComposeUiApi::class)
+    @Test
+    fun `material3 OutlinedTextField and desktop UI components render without linkage errors`() {
+        val scene = androidx.compose.ui.ImageComposeScene(width = 800, height = 600) {
+            com.metrolist.desktop.ui.theme.MiliMusicDesktopTheme(
+                darkMode = com.metrolist.desktop.data.DesktopDarkMode.DARK,
+                pureBlack = false,
+                seedColor = com.metrolist.desktop.ui.theme.DefaultThemeColor,
+            ) {
+                androidx.compose.foundation.layout.Column {
+                    androidx.compose.material3.OutlinedTextField(
+                        value = "query",
+                        onValueChange = {},
+                        label = { androidx.compose.material3.Text("Buscar música") },
+                        singleLine = true,
+                    )
+                    androidx.compose.material3.PrimaryScrollableTabRow(selectedTabIndex = 0) {
+                        androidx.compose.material3.Tab(
+                            selected = true,
+                            onClick = {},
+                            text = { androidx.compose.material3.Text("Favoritas") },
+                        )
+                    }
+                    androidx.compose.material3.Slider(value = 0.5f, onValueChange = {})
+                    androidx.compose.material3.Switch(checked = true, onCheckedChange = {})
+                    androidx.compose.material3.FilterChip(
+                        selected = true,
+                        onClick = {},
+                        label = { androidx.compose.material3.Text("Todo") },
+                    )
+                }
+            }
+        }
+        try {
+            val img = scene.render()
+            assertEquals(800, img.width)
+            assertEquals(600, img.height)
+        } finally {
+            scene.close()
+        }
+    }
 }
+
 

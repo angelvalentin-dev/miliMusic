@@ -205,6 +205,10 @@ class DesktopLyricsService(
         val ttml: String? = null,
     )
 
+    fun close() {
+        runCatching { httpClient.close() }
+    }
+
     companion object {
         const val LYRICS_NOT_FOUND = "LYRICS_NOT_FOUND"
     }

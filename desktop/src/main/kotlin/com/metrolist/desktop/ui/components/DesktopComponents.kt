@@ -262,8 +262,8 @@ fun SongRowItem(
     val likedSongs by appState.likedSongs.collectAsState()
     val downloadedSongs by appState.downloadedSongs.collectAsState()
 
-    val isLiked = song.liked || likedSongs.any { it.id == song.id }
-    val isDownloaded = song.isDownloaded || downloadedSongs.any { it.id == song.id }
+    val isLiked = likedSongs.any { it.id == song.id }
+    val isDownloaded = downloadedSongs.any { it.id == song.id }
     val downloadProgress = downloadingMap[song.id]
     var menuExpanded by remember { mutableStateOf(false) }
 

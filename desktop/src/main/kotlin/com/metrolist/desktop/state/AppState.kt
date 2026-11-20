@@ -34,6 +34,7 @@ import com.metrolist.innertube.utils.parseCookieString
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -45,6 +46,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 sealed interface NavDestination {
     data object Home : NavDestination
@@ -520,13 +522,30 @@ class DesktopAppState {
         }
     }
 
+    private val isShutDown = AtomicBoolean(false)
+
+    val hasOpenDialog: Boolean
+        get() = _showLoginDialog.value ||
+            _playlistPickerSong.value != null ||
+            _showEqualizerDialog.value ||
+            _showSleepTimerDialog.value ||
+            _showListenTogetherDialog.value ||
+            _showWrappedDialog.value
+
     fun shutdown() {
-        alarmScheduler.stop()
-        listenTogetherManager.disconnect()
-        discordRpc.shutdown()
-        audioPlayer.release()
-        proxyServer.close()
-        smtcManager.shutdown()
+        if (!isShutDown.compareAndSet(false, true)) return
+        runCatching { alarmScheduler.stop() }
+        runCatching { listenTogetherManager.shutdown() }
+        runCatching { discordRpc.shutdown() }
+        runCatching { downloadManager.close() }
+        // Close local proxy first so any blocking libVLC HTTP read unblocks immediately.
+        runCatching { proxyServer.close() }
+        runCatching { audioPlayer.release() }
+        runCatching { lyricsService.close() }
+        runCatching { streamResolver.close() }
+        runCatching { DesktopLastFmService.close() }
+        runCatching { smtcManager.shutdown() }
+        scope.cancel()
     }
 }
 

@@ -146,7 +146,7 @@ fun DesktopPlayerBar(appState: DesktopAppState) {
                         )
                     }
                     if (song != null) {
-                        val isLiked = song.liked || likedSongs.any { it.id == song.id }
+                        val isLiked = likedSongs.any { it.id == song.id }
                         IconButton(onClick = { appState.toggleLike(song) }) {
                             Icon(
                                 imageVector = if (isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,

@@ -98,6 +98,18 @@ class InnerTubeStreamResolver {
     suspend fun refreshAfterRejection(): Boolean =
         runCatching { bundle().cipherService.refreshAfterStreamRejection() }.getOrDefault(false)
 
+    fun close() {
+        val bundle = currentBundle ?: return
+        currentBundle = null
+        runCatching {
+            kotlinx.coroutines.runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(1_000L) {
+                    bundle.cipherService.dispose()
+                }
+            }
+        }
+    }
+
     private fun currentFailedClients(videoId: String): Set<String> {
         val entry = failedClients[videoId] ?: return emptySet()
         if (System.currentTimeMillis() - entry.second > 5 * 60 * 1000L) {

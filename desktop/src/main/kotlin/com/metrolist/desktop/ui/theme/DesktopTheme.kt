@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import com.materialkolor.PaletteStyle
 import com.materialkolor.dynamiccolor.ColorSpec
 import com.materialkolor.rememberDynamicColorScheme
@@ -91,7 +92,7 @@ fun rememberArtworkSeedColor(
                     }
                     y += stepY
                 }
-                val ranked = Score.score(histogram, 1, fallback.value.toInt(), true)
+                val ranked = Score.score(histogram, 1, fallback.toArgb(), true)
                 Color(ranked.first())
             }.getOrDefault(fallback)
         }

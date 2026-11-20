@@ -678,4 +678,11 @@ class DesktopListenTogetherManager(
         webSocket = null
         _state.value = LtState()
     }
+
+    fun shutdown() {
+        disconnect()
+        runCatching { httpClient.dispatcher.cancelAll() }
+        runCatching { httpClient.dispatcher.executorService.shutdownNow() }
+        runCatching { httpClient.connectionPool.evictAll() }
+    }
 }

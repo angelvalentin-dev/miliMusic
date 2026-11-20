@@ -11,6 +11,9 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -28,11 +31,15 @@ class StreamProxyServer(
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
+    private val serverExecutor: ExecutorService = Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "miliMusic-stream-proxy").apply { isDaemon = true }
+    }
+
     private val server: HttpServer = HttpServer.create(
         InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
         0,
     ).apply {
-        executor = Executors.newCachedThreadPool()
+        executor = serverExecutor
         createContext("/stream/") { exchange -> handleStream(exchange) }
         start()
     }
@@ -76,17 +83,14 @@ class StreamProxyServer(
 
             val rangeHeader = exchange.requestHeaders.getFirst("Range")
             if (rangeHeader == null && (resolved.requireBoundedRange || resolved.useRangeChunks) && (resolved.contentLengthBytes ?: 0L) > 0L) {
-                streamChunkedUpstream(exchange, resolved)
+                streamChunkedUpstream(exchange, videoId, quality, resolved)
                 return
             }
 
             var response = openUpstream(resolved, rangeHeader)
             if (response.code == 403 || response.code == 410) {
                 response.close()
-                resolver.markClientFailed(videoId, resolved.clientName)
-                runBlocking { resolver.refreshAfterRejection() }
-                resolved = runBlocking { resolver.resolve(videoId, quality, forceRefresh = true) }.getOrNull()
-                if (resolved == null) {
+                resolved = refreshStream(videoId, quality, resolved.clientName) ?: run {
                     exchange.sendResponseHeaders(502, -1)
                     return
                 }
@@ -98,37 +102,40 @@ class StreamProxyServer(
                 val contentType = upstream.header("Content-Type") ?: resolved.mimeType
                 val contentRange = upstream.header("Content-Range")
                 val acceptRanges = upstream.header("Accept-Ranges") ?: "bytes"
-                val contentLength = upstream.body?.contentLength() ?: -1L
+                val contentLength = upstream.body.contentLength()
+                val isHead = exchange.requestMethod.equals("HEAD", ignoreCase = true)
 
                 exchange.responseHeaders.set("Content-Type", contentType)
                 exchange.responseHeaders.set("Accept-Ranges", acceptRanges)
                 if (contentRange != null) exchange.responseHeaders.set("Content-Range", contentRange)
 
+                if (isHead) {
+                    if (contentLength > 0L) exchange.responseHeaders.set("Content-Length", contentLength.toString())
+                    exchange.sendResponseHeaders(status, -1)
+                    return
+                }
+
                 val responseLength = if (contentLength > 0L) contentLength else 0L
                 exchange.sendResponseHeaders(status, responseLength)
 
-                if (exchange.requestMethod.equals("HEAD", ignoreCase = true)) return
-
                 val isFullDownload = status == 200 && cacheEnabledProvider() && rangeHeader == null
-                val cacheTemp = if (isFullDownload) File(cacheDirProvider(), "$videoId.part") else null
+                val cacheTemp = if (isFullDownload) File(cacheDirProvider(), "$videoId.${System.nanoTime()}.part") else null
                 val cacheFinal = if (isFullDownload) File(cacheDirProvider(), "$videoId.cache") else null
                 val cacheOut = cacheTemp?.outputStream()?.buffered()
 
                 try {
-                    val bodyStream = upstream.body?.byteStream()
-                    if (bodyStream != null) {
-                        val buffer = ByteArray(32 * 1024)
-                        while (true) {
-                            val read = bodyStream.read(buffer)
-                            if (read == -1) break
-                            exchange.responseBody.write(buffer, 0, read)
-                            cacheOut?.write(buffer, 0, read)
-                        }
+                    val bodyStream = upstream.body.byteStream()
+                    val buffer = ByteArray(32 * 1024)
+                    while (true) {
+                        val read = bodyStream.read(buffer)
+                        if (read == -1) break
+                        exchange.responseBody.write(buffer, 0, read)
+                        cacheOut?.write(buffer, 0, read)
                     }
                     cacheOut?.flush()
                     cacheOut?.close()
                     if (cacheTemp != null && cacheFinal != null && cacheTemp.exists() && cacheTemp.length() > 0L) {
-                        if (cacheTemp.renameTo(cacheFinal)) {
+                        if (replaceFile(cacheTemp, cacheFinal)) {
                             runCatching { onSongCached(videoId) }
                         }
                     }
@@ -144,27 +151,82 @@ class StreamProxyServer(
         }
     }
 
-    private fun streamChunkedUpstream(exchange: HttpExchange, resolved: ResolvedStream) {
-        val total = resolved.contentLengthBytes ?: return
-        val chunkSize = if (resolved.rangeChunkSizeBytes > 0L) resolved.rangeChunkSizeBytes else 8L * 1024L * 1024L
+    private fun refreshStream(videoId: String, quality: DesktopAudioQuality, failedClient: String): ResolvedStream? {
+        resolver.markClientFailed(videoId, failedClient)
+        runBlocking { resolver.refreshAfterRejection() }
+        return runBlocking { resolver.resolve(videoId, quality, forceRefresh = true) }.getOrNull()
+    }
+
+    private fun streamChunkedUpstream(
+        exchange: HttpExchange,
+        videoId: String,
+        quality: DesktopAudioQuality,
+        initial: ResolvedStream,
+    ) {
+        var resolved = initial
+        var total = resolved.contentLengthBytes ?: return
+        var chunkSize = if (resolved.rangeChunkSizeBytes > 0L) resolved.rangeChunkSizeBytes else 8L * 1024L * 1024L
+
+        if (exchange.requestMethod.equals("HEAD", ignoreCase = true)) {
+            exchange.responseHeaders.set("Content-Type", resolved.mimeType)
+            exchange.responseHeaders.set("Accept-Ranges", "bytes")
+            exchange.responseHeaders.set("Content-Length", total.toString())
+            exchange.sendResponseHeaders(200, -1)
+            return
+        }
+
+        // Open chunk 0 before committing 200 headers so 403/410 can trigger stream refresh.
+        var firstEnd = minOf(chunkSize - 1, total - 1)
+        var firstResp = openUpstream(resolved, "bytes=0-$firstEnd")
+        if (firstResp.code == 403 || firstResp.code == 410) {
+            firstResp.close()
+            resolved = refreshStream(videoId, quality, resolved.clientName) ?: run {
+                exchange.sendResponseHeaders(502, -1)
+                return
+            }
+            total = resolved.contentLengthBytes ?: run {
+                exchange.sendResponseHeaders(502, -1)
+                return
+            }
+            chunkSize = if (resolved.rangeChunkSizeBytes > 0L) resolved.rangeChunkSizeBytes else 8L * 1024L * 1024L
+            firstEnd = minOf(chunkSize - 1, total - 1)
+            firstResp = openUpstream(resolved, "bytes=0-$firstEnd")
+        }
+
+        if (!firstResp.isSuccessful) {
+            val code = firstResp.code
+            firstResp.close()
+            exchange.sendResponseHeaders(code, -1)
+            return
+        }
+
         exchange.responseHeaders.set("Content-Type", resolved.mimeType)
         exchange.responseHeaders.set("Accept-Ranges", "bytes")
         exchange.sendResponseHeaders(200, total)
-        if (exchange.requestMethod.equals("HEAD", ignoreCase = true)) return
 
         val cacheEnabled = cacheEnabledProvider()
-        val cacheTemp = if (cacheEnabled) File(cacheDirProvider(), "${resolved.videoId}.part") else null
+        val cacheTemp = if (cacheEnabled) File(cacheDirProvider(), "${resolved.videoId}.${System.nanoTime()}.part") else null
         val cacheFinal = if (cacheEnabled) File(cacheDirProvider(), "${resolved.videoId}.cache") else null
         val cacheOut = cacheTemp?.outputStream()?.buffered()
 
         try {
             var offset = 0L
             val buf = ByteArray(32 * 1024)
+            firstResp.use { resp ->
+                val input = resp.body.byteStream()
+                while (true) {
+                    val read = input.read(buf)
+                    if (read == -1) break
+                    exchange.responseBody.write(buf, 0, read)
+                    cacheOut?.write(buf, 0, read)
+                    offset += read
+                }
+            }
             while (offset < total) {
                 val end = minOf(offset + chunkSize - 1, total - 1)
                 openUpstream(resolved, "bytes=$offset-$end").use { resp ->
                     if (!resp.isSuccessful) error("HTTP ${resp.code} chunking stream")
-                    val input = resp.body?.byteStream() ?: break
+                    val input = resp.body.byteStream()
                     while (true) {
                         val read = input.read(buf)
                         if (read == -1) break
@@ -177,7 +239,7 @@ class StreamProxyServer(
             cacheOut?.flush()
             cacheOut?.close()
             if (cacheTemp != null && cacheFinal != null && cacheTemp.exists() && cacheTemp.length() == total) {
-                if (cacheTemp.renameTo(cacheFinal)) {
+                if (replaceFile(cacheTemp, cacheFinal)) {
                     runCatching { onSongCached(resolved.videoId) }
                 }
             }
@@ -186,6 +248,15 @@ class StreamProxyServer(
             cacheTemp?.delete()
         }
     }
+
+    private fun replaceFile(source: File, target: File): Boolean =
+        runCatching {
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            true
+        }.getOrElse {
+            source.delete()
+            false
+        }
 
     private fun openUpstream(resolved: ResolvedStream, rangeHeader: String?): okhttp3.Response {
         val reqBuilder = Request.Builder().url(resolved.url)
@@ -202,6 +273,7 @@ class StreamProxyServer(
     private fun serveLocalFile(exchange: HttpExchange, file: File) {
         val total = file.length()
         val range = exchange.requestHeaders.getFirst("Range")
+        val isHead = exchange.requestMethod.equals("HEAD", ignoreCase = true)
         val contentType = when (file.extension.lowercase()) {
             "m4a", "mp4" -> "audio/mp4"
             "mp3" -> "audio/mpeg"
@@ -212,14 +284,28 @@ class StreamProxyServer(
         exchange.responseHeaders.set("Accept-Ranges", "bytes")
 
         if (range != null && range.startsWith("bytes=")) {
+            if (total <= 0L) {
+                exchange.responseHeaders.set("Content-Range", "bytes */0")
+                exchange.sendResponseHeaders(416, -1)
+                return
+            }
             val spec = range.removePrefix("bytes=").substringBefore(",")
             val parts = spec.split("-")
             val start = parts.getOrNull(0)?.toLongOrNull() ?: 0L
             val end = parts.getOrNull(1)?.toLongOrNull()?.coerceAtMost(total - 1) ?: (total - 1)
-            val len = (end - start + 1).coerceAtLeast(0L)
+            if (start < 0L || start >= total || end < start) {
+                exchange.responseHeaders.set("Content-Range", "bytes */$total")
+                exchange.sendResponseHeaders(416, -1)
+                return
+            }
+            val len = end - start + 1
             exchange.responseHeaders.set("Content-Range", "bytes $start-$end/$total")
+            if (isHead) {
+                exchange.responseHeaders.set("Content-Length", len.toString())
+                exchange.sendResponseHeaders(206, -1)
+                return
+            }
             exchange.sendResponseHeaders(206, len)
-            if (exchange.requestMethod.equals("HEAD", ignoreCase = true)) return
             RandomAccessFile(file, "r").use { raf ->
                 raf.seek(start)
                 val buf = ByteArray(32 * 1024)
@@ -232,13 +318,21 @@ class StreamProxyServer(
                 }
             }
         } else {
+            if (isHead) {
+                exchange.responseHeaders.set("Content-Length", total.toString())
+                exchange.sendResponseHeaders(200, -1)
+                return
+            }
             exchange.sendResponseHeaders(200, total)
-            if (exchange.requestMethod.equals("HEAD", ignoreCase = true)) return
             file.inputStream().buffered().use { it.copyTo(exchange.responseBody) }
         }
     }
 
     fun close() {
         runCatching { server.stop(0) }
+        runCatching { serverExecutor.shutdownNow() }
+        runCatching { httpClient.dispatcher.cancelAll() }
+        runCatching { httpClient.dispatcher.executorService.shutdownNow() }
+        runCatching { httpClient.connectionPool.evictAll() }
     }
 }

@@ -101,147 +101,233 @@ import com.metrolist.desktop.ui.icons.History
 import com.metrolist.desktop.ui.theme.DefaultThemeColor
 import com.metrolist.desktop.ui.theme.MiliMusicDesktopTheme
 import com.metrolist.desktop.ui.theme.rememberArtworkSeedColor
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import okio.Path.Companion.toOkioPath
+import java.awt.Frame
 import java.awt.SystemTray
 import javax.imageio.ImageIO
+import javax.swing.SwingUtilities
+import androidx.compose.ui.awt.ComposeWindow
 import androidx.compose.ui.graphics.toComposeImageBitmap
+import kotlin.system.exitProcess
 
-fun main() = application {
-    val appState = remember { DesktopAppState() }
-    val settings by appState.settings.collectAsState()
-    val pb by appState.playbackState.collectAsState()
+private data class TopLevelPlaybackSummary(
+    val title: String? = null,
+    val thumbnailUrl: String? = null,
+    val isPlaying: Boolean = false,
+    val hasSong: Boolean = false,
+)
 
-    var windowVisible by remember { mutableStateOf(true) }
-    val windowState = remember { WindowState(size = DpSize(1280.dp, 820.dp)) }
+fun main() {
+    val instanceGuard = SingleInstanceGuard.tryAcquire() ?: exitProcess(0)
+    val appState = DesktopAppState()
+    val shutdownHook = Thread({
+        appState.shutdown()
+        instanceGuard.close()
+    }, "miliMusic-shutdown-hook")
+    runCatching { Runtime.getRuntime().addShutdownHook(shutdownHook) }
 
-    val iconPainter = remember {
-        runCatching {
-            DesktopAppState::class.java.classLoader
-                .getResourceAsStream("icons/milimusic.png")
-                ?.use { ImageIO.read(it) }
-                ?.toComposeImageBitmap()
-                ?.let { BitmapPainter(it) }
-        }.getOrNull()
-    }
+    try {
+        application(exitProcessOnExit = false) {
+            val settings by appState.settings.collectAsState()
+            val playbackSummary by remember(appState) {
+                appState.playbackState
+                    .map { pb ->
+                        TopLevelPlaybackSummary(
+                            title = pb.currentSong?.title,
+                            thumbnailUrl = pb.currentSong?.thumbnailUrl,
+                            isPlaying = pb.isPlaying,
+                            hasSong = pb.currentSong != null,
+                        )
+                    }
+                    .distinctUntilChanged()
+            }.collectAsState(initial = TopLevelPlaybackSummary())
 
-    if (SystemTray.isSupported() && iconPainter != null) {
-        Tray(
-            icon = iconPainter,
-            tooltip = pb.currentSong?.let { "miliMusic — ${it.title}" } ?: "miliMusic",
-            onAction = { windowVisible = true },
-            menu = {
-                Item("Mostrar miliMusic", onClick = { windowVisible = true })
-                Separator()
-                Item(
-                    if (pb.isPlaying) "Pausar" else "Reproducir",
-                    enabled = pb.currentSong != null,
-                    onClick = { appState.audioPlayer.togglePlayPause() },
-                )
-                Item("Siguiente", enabled = pb.currentSong != null, onClick = { appState.audioPlayer.next() })
-                Item("Anterior", enabled = pb.currentSong != null, onClick = { appState.audioPlayer.previous() })
-                Separator()
-                Item("Salir", onClick = {
-                    appState.shutdown()
-                    exitApplication()
-                })
-            },
-        )
-    }
+            var windowVisible by remember { mutableStateOf(true) }
+            val windowState = remember { WindowState(size = DpSize(1280.dp, 820.dp)) }
+            var awtWindowRef by remember { mutableStateOf<ComposeWindow?>(null) }
 
-    Window(
-        visible = windowVisible,
-        state = windowState,
-        title = "miliMusic",
-        icon = iconPainter,
-        onCloseRequest = {
-            if (settings.minimizeToTray && SystemTray.isSupported()) {
+            LaunchedEffect(instanceGuard) {
+                instanceGuard.setOnActivate {
+                    SwingUtilities.invokeLater {
+                        windowVisible = true
+                        windowState.isMinimized = false
+                        awtWindowRef?.let { win ->
+                            win.isVisible = true
+                            if ((win.extendedState and Frame.ICONIFIED) != 0) {
+                                win.extendedState = win.extendedState and Frame.ICONIFIED.inv()
+                            }
+                            win.toFront()
+                            win.requestFocus()
+                        }
+                    }
+                }
+            }
+
+            fun requestExit() {
                 windowVisible = false
-            } else {
-                appState.shutdown()
                 exitApplication()
             }
-        },
-        onPreviewKeyEvent = { event ->
-            if (event.type == KeyEventType.KeyDown) {
-                when {
-                    event.isCtrlPressed && event.key == Key.F -> {
-                        appState.navigate(NavDestination.Search())
-                        true
-                    }
-                    event.isCtrlPressed && event.key == Key.L -> {
-                        appState.toggleLyricsPanel()
-                        true
-                    }
-                    event.isCtrlPressed && event.key == Key.Q -> {
-                        appState.toggleQueuePanel()
-                        true
-                    }
-                    event.isCtrlPressed && event.key == Key.E -> {
-                        appState.openEqualizerDialog()
-                        true
-                    }
-                    event.isCtrlPressed && event.key == Key.DirectionRight -> {
-                        appState.audioPlayer.next()
-                        true
-                    }
-                    event.isCtrlPressed && event.key == Key.DirectionLeft -> {
-                        appState.audioPlayer.previous()
-                        true
-                    }
-                    event.isAltPressed && event.key == Key.DirectionLeft -> {
-                        appState.goBack()
-                        true
-                    }
-                    event.isAltPressed && event.key == Key.DirectionRight -> {
-                        appState.goForward()
-                        true
-                    }
-                    else -> false
-                }
-            } else false
-        },
-        onKeyEvent = { event ->
-            if (event.type == KeyEventType.KeyDown &&
-                event.key == Key.Spacebar &&
-                !event.isCtrlPressed &&
-                !event.isAltPressed
-            ) {
-                appState.audioPlayer.togglePlayPause()
-                true
-            } else {
-                false
-            }
-        },
-    ) {
-        window.minimumSize = java.awt.Dimension(960, 640)
 
-        setSingletonImageLoaderFactory { context ->
-            ImageLoader.Builder(context)
-                .components { add(OkHttpNetworkFetcherFactory()) }
-                .diskCache {
-                    DiskCache.Builder()
-                        .directory(AppPaths.imageCacheDir.toOkioPath())
-                        .maxSizeBytes(256L * 1024L * 1024L)
+            val iconPainter = remember {
+                runCatching {
+                    DesktopAppState::class.java.classLoader
+                        .getResourceAsStream("icons/milimusic.png")
+                        ?.use { ImageIO.read(it) }
+                        ?.toComposeImageBitmap()
+                        ?.let { BitmapPainter(it) }
+                }.getOrNull()
+            }
+
+            if (SystemTray.isSupported() && iconPainter != null) {
+                Tray(
+                    icon = iconPainter,
+                    tooltip = playbackSummary.title?.let { "miliMusic — $it" } ?: "miliMusic",
+                    onAction = {
+                        windowVisible = true
+                        windowState.isMinimized = false
+                        SwingUtilities.invokeLater {
+                            awtWindowRef?.let { win ->
+                                win.isVisible = true
+                                win.toFront()
+                                win.requestFocus()
+                            }
+                        }
+                    },
+                    menu = {
+                        Item("Mostrar miliMusic", onClick = {
+                            windowVisible = true
+                            windowState.isMinimized = false
+                        })
+                        Separator()
+                        Item(
+                            if (playbackSummary.isPlaying) "Pausar" else "Reproducir",
+                            enabled = playbackSummary.hasSong,
+                            onClick = { appState.audioPlayer.togglePlayPause() },
+                        )
+                        Item("Siguiente", enabled = playbackSummary.hasSong, onClick = { appState.audioPlayer.next() })
+                        Item("Anterior", enabled = playbackSummary.hasSong, onClick = { appState.audioPlayer.previous() })
+                        Separator()
+                        Item("Salir", onClick = { requestExit() })
+                    },
+                )
+            }
+
+            Window(
+                visible = windowVisible,
+                state = windowState,
+                title = "miliMusic",
+                icon = iconPainter,
+                onCloseRequest = {
+                    if (settings.minimizeToTray && SystemTray.isSupported()) {
+                        windowVisible = false
+                    } else {
+                        requestExit()
+                    }
+                },
+                onPreviewKeyEvent = { event ->
+                    if (event.type == KeyEventType.KeyDown) {
+                        when {
+                            event.isCtrlPressed && event.key == Key.F -> {
+                                appState.navigate(NavDestination.Search())
+                                true
+                            }
+                            event.isCtrlPressed && event.key == Key.L -> {
+                                appState.toggleLyricsPanel()
+                                true
+                            }
+                            event.isCtrlPressed && event.key == Key.Q -> {
+                                appState.toggleQueuePanel()
+                                true
+                            }
+                            event.isCtrlPressed && event.key == Key.E -> {
+                                appState.openEqualizerDialog()
+                                true
+                            }
+                            event.isCtrlPressed && event.key == Key.DirectionRight -> {
+                                appState.audioPlayer.next()
+                                true
+                            }
+                            event.isCtrlPressed && event.key == Key.DirectionLeft -> {
+                                appState.audioPlayer.previous()
+                                true
+                            }
+                            event.isAltPressed && event.key == Key.DirectionLeft -> {
+                                appState.goBack()
+                                true
+                            }
+                            event.isAltPressed && event.key == Key.DirectionRight -> {
+                                appState.goForward()
+                                true
+                            }
+                            else -> false
+                        }
+                    } else false
+                },
+                onKeyEvent = { event ->
+                    val dest = appState.currentDestination.value
+                    val allowSpaceShortcut = !appState.hasOpenDialog &&
+                        dest !is NavDestination.Search &&
+                        dest !is NavDestination.Settings
+                    if (allowSpaceShortcut &&
+                        event.type == KeyEventType.KeyDown &&
+                        event.key == Key.Spacebar &&
+                        !event.isCtrlPressed &&
+                        !event.isAltPressed
+                    ) {
+                        appState.audioPlayer.togglePlayPause()
+                        true
+                    } else {
+                        false
+                    }
+                },
+            ) {
+                LaunchedEffect(window) {
+                    awtWindowRef = window
+                    window.minimumSize = java.awt.Dimension(960, 640)
+                }
+
+                setSingletonImageLoaderFactory { context ->
+                    ImageLoader.Builder(context)
+                        .components { add(OkHttpNetworkFetcherFactory()) }
+                        .diskCache {
+                            DiskCache.Builder()
+                                .directory(AppPaths.imageCacheDir.toOkioPath())
+                                .maxSizeBytes(256L * 1024L * 1024L)
+                                .build()
+                        }
                         .build()
                 }
-                .build()
-        }
 
-        val fallbackColor = Color(settings.selectedThemeColor)
-        val seedColor = rememberArtworkSeedColor(
-            thumbnailUrl = pb.currentSong?.thumbnailUrl,
-            fallback = if (settings.selectedThemeColor == 0) DefaultThemeColor else fallbackColor,
-            enabled = settings.dynamicTheme,
-        )
+                val fallbackColor = Color(settings.selectedThemeColor)
+                val seedColor = rememberArtworkSeedColor(
+                    thumbnailUrl = playbackSummary.thumbnailUrl,
+                    fallback = if (settings.selectedThemeColor == 0) DefaultThemeColor else fallbackColor,
+                    enabled = settings.dynamicTheme,
+                )
 
-        MiliMusicDesktopTheme(
-            darkMode = settings.darkMode,
-            pureBlack = settings.pureBlack,
-            seedColor = seedColor,
-        ) {
-            DesktopShell(appState)
+                MiliMusicDesktopTheme(
+                    darkMode = settings.darkMode,
+                    pureBlack = settings.pureBlack,
+                    seedColor = seedColor,
+                ) {
+                    DesktopShell(appState)
+                }
+            }
         }
+    } finally {
+        runCatching { Runtime.getRuntime().removeShutdownHook(shutdownHook) }
+        val cleanupThread = Thread({
+            appState.shutdown()
+            instanceGuard.close()
+        }, "miliMusic-exit-cleanup").apply {
+            isDaemon = true
+            start()
+        }
+        runCatching { cleanupThread.join(3_000L) }
     }
+    exitProcess(0)
 }
 
 @Composable
@@ -252,12 +338,20 @@ private fun DesktopShell(appState: DesktopAppState) {
     val settings by appState.settings.collectAsState()
     val playlists by appState.playlists.collectAsState()
     val statusMsg by appState.statusMessage.collectAsState()
+    val playbackError by remember(appState) {
+        appState.playbackState.map { it.errorMessage }.distinctUntilChanged()
+    }.collectAsState(initial = null)
     val snackbarHost = remember { SnackbarHostState() }
 
     LaunchedEffect(statusMsg) {
         val msg = statusMsg ?: return@LaunchedEffect
         snackbarHost.showSnackbar(msg)
         appState.clearStatus()
+    }
+
+    LaunchedEffect(playbackError) {
+        val err = playbackError ?: return@LaunchedEffect
+        snackbarHost.showSnackbar(err)
     }
 
     Scaffold(

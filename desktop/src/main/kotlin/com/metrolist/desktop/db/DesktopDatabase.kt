@@ -29,7 +29,6 @@ class DesktopDatabase(
             createStatement().use { st ->
                 st.execute("PRAGMA busy_timeout = 60000")
                 st.execute("PRAGMA foreign_keys = ON")
-                st.execute("PRAGMA journal_mode = WAL")
                 st.execute("PRAGMA synchronous = NORMAL")
             }
         }
@@ -37,6 +36,9 @@ class DesktopDatabase(
 
     private fun ensureSchema() = synchronized(dbLock) {
         openConnection().use { conn ->
+            conn.createStatement().use { st ->
+                st.execute("PRAGMA journal_mode = WAL")
+            }
             val version = conn.createStatement().use { st ->
                 st.executeQuery("PRAGMA user_version").use { rs -> if (rs.next()) rs.getInt(1) else 0 }
             }

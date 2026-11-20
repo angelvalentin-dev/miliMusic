@@ -6,6 +6,7 @@ import com.metrolist.desktop.db.DesktopSong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -15,6 +16,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.TimeUnit
 
 class DownloadManager(
@@ -38,18 +41,20 @@ class DownloadManager(
         _downloading.update { it + (song.id to 0f) }
 
         scope.launch {
+            var partFile: File? = null
             try {
                 database.upsertSong(song)
                 val resolved = resolver.resolve(song.id, qualityProvider()).getOrThrow()
                 val dir = downloadsDirProvider().apply { mkdirs() }
                 val ext = if (resolved.mimeType.contains("mp4", ignoreCase = true)) "m4a" else "webm"
-                val partFile = File(dir, "${song.id}.$ext.part")
+                val tmp = File(dir, "${song.id}.$ext.part")
+                partFile = tmp
                 val finalFile = File(dir, "${song.id}.$ext")
 
                 val totalBytes = resolved.contentLengthBytes ?: -1L
                 val chunkSize = if (resolved.rangeChunkSizeBytes > 0L) resolved.rangeChunkSizeBytes else 8L * 1024L * 1024L
 
-                FileOutputStream(partFile).buffered().use { out ->
+                FileOutputStream(tmp).buffered().use { out ->
                     if ((resolved.requireBoundedRange || resolved.useRangeChunks) && totalBytes > 0L) {
                         var offset = 0L
                         while (offset < totalBytes) {
@@ -60,7 +65,7 @@ class DownloadManager(
                             }.build()
                             httpClient.newCall(req).execute().use { resp ->
                                 check(resp.isSuccessful) { "HTTP ${resp.code} downloading ${song.id}" }
-                                resp.body?.byteStream()?.use { input ->
+                                resp.body.byteStream().use { input ->
                                     val buf = ByteArray(32 * 1024)
                                     while (true) {
                                         val read = input.read(buf)
@@ -80,9 +85,9 @@ class DownloadManager(
                         }.build()
                         httpClient.newCall(req).execute().use { resp ->
                             check(resp.isSuccessful) { "HTTP ${resp.code} downloading ${song.id}" }
-                            val len = resp.body?.contentLength() ?: totalBytes
+                            val len = resp.body.contentLength().takeIf { it > 0L } ?: totalBytes
                             var written = 0L
-                            resp.body?.byteStream()?.use { input ->
+                            resp.body.byteStream().use { input ->
                                 val buf = ByteArray(32 * 1024)
                                 while (true) {
                                     val read = input.read(buf)
@@ -100,10 +105,10 @@ class DownloadManager(
                     }
                 }
 
-                if (finalFile.exists()) finalFile.delete()
-                check(partFile.renameTo(finalFile)) { "Failed to finalize download file" }
+                Files.move(tmp.toPath(), finalFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
                 database.setDownloaded(song, true)
             } catch (t: Throwable) {
+                partFile?.delete()
                 t.printStackTrace()
             } finally {
                 _downloading.update { it - song.id }
@@ -120,5 +125,12 @@ class DownloadManager(
             }
             database.setDownloaded(song, false)
         }
+    }
+
+    fun close() {
+        scope.cancel()
+        runCatching { httpClient.dispatcher.cancelAll() }
+        runCatching { httpClient.dispatcher.executorService.shutdownNow() }
+        runCatching { httpClient.connectionPool.evictAll() }
     }
 }

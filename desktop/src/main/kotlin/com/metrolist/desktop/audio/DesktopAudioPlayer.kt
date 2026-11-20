@@ -11,6 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,11 +22,16 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import uk.co.caprica.vlcj.binding.lib.LibC
 import uk.co.caprica.vlcj.binding.support.runtime.RuntimeUtil
 import uk.co.caprica.vlcj.factory.MediaPlayerFactory
+import uk.co.caprica.vlcj.factory.discovery.NativeDiscovery
+import uk.co.caprica.vlcj.factory.discovery.strategy.BaseNativeDiscoveryStrategy
+import uk.co.caprica.vlcj.factory.discovery.strategy.WindowsNativeDiscoveryStrategy
 import uk.co.caprica.vlcj.player.base.Equalizer
 import uk.co.caprica.vlcj.player.base.MediaPlayer
 import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter
+import uk.co.caprica.vlcj.player.base.State
 import uk.co.caprica.vlcj.player.component.AudioPlayerComponent
 import java.io.File
 import kotlin.math.roundToInt
@@ -105,6 +111,7 @@ class DesktopAudioPlayer(
     private var mediaPlayer: MediaPlayer? = null
     private var vlcEqualizer: Equalizer? = null
     private var positionJob: Job? = null
+    private var playTrackJob: Job? = null
     private var currentSongStartTimeMs: Long = 0L
     private var recordedCurrentPlay: Boolean = false
     private var pendingRestoredSeekMs: Long = 0L
@@ -117,24 +124,31 @@ class DesktopAudioPlayer(
         startPositionTicker()
     }
 
+    private fun createVlcDiscovery(bundledVlcDir: File?): NativeDiscovery {
+        if (bundledVlcDir == null || !bundledVlcDir.exists() || !AppPaths.isWindows) {
+            return NativeDiscovery()
+        }
+        val bundledStrategy = object : BaseNativeDiscoveryStrategy(
+            arrayOf("libvlc\\.dll", "libvlccore\\.dll"),
+            arrayOf("%s\\plugins", "%s\\vlc\\plugins"),
+        ) {
+            override fun supported(): Boolean = RuntimeUtil.isWindows()
+            override fun discoveryDirectories(): List<String> = listOf(bundledVlcDir.absolutePath)
+            override fun setPluginPath(path: String): Boolean =
+                runCatching { LibC.INSTANCE._putenv("VLC_PLUGIN_PATH=$path") == 0 }.getOrDefault(false)
+        }
+        return NativeDiscovery(bundledStrategy, WindowsNativeDiscoveryStrategy())
+    }
+
     private fun initVlc() {
         try {
             val bundledVlcDir = AppPaths.bundledFile("vlc")
             if (bundledVlcDir != null && bundledVlcDir.exists()) {
                 NativeLibrary.addSearchPath(RuntimeUtil.getLibVlcLibraryName(), bundledVlcDir.absolutePath)
+                NativeLibrary.addSearchPath(RuntimeUtil.getLibVlcCoreLibraryName(), bundledVlcDir.absolutePath)
             }
-            val args = buildList {
-                add("--no-video")
-                add("--quiet")
-                if (bundledVlcDir != null) {
-                    val pluginsDir = bundledVlcDir.resolve("plugins")
-                    if (pluginsDir.exists()) {
-                        add("--plugin-path=${pluginsDir.absolutePath}")
-                    }
-                }
-            }.toTypedArray()
-
-            val factory = MediaPlayerFactory(*args)
+            val discovery = createVlcDiscovery(bundledVlcDir)
+            val factory = MediaPlayerFactory(discovery, "--no-video", "--quiet")
             val component = AudioPlayerComponent(factory)
             val player = component.mediaPlayer()
             player.events().addMediaPlayerEventListener(
@@ -273,22 +287,25 @@ class DesktopAudioPlayer(
         }
     }
 
-    fun persistQueueSnapshot() {
+    private fun writeQueueSnapshotNow() {
         if (!persistentQueueProvider()) return
         val st = _state.value
-        scope.launch {
-            runCatching {
-                queueFile.parentFile?.mkdirs()
-                val snapshot = PersistedQueueSnapshot(
-                    queue = st.queue.take(200),
-                    currentIndex = st.currentIndex,
-                    positionMs = st.positionMs,
-                    shuffle = st.shuffle,
-                    repeatMode = st.repeatMode.name,
-                )
-                queueFile.writeText(queueJson.encodeToString(snapshot))
-            }
+        runCatching {
+            queueFile.parentFile?.mkdirs()
+            val snapshot = PersistedQueueSnapshot(
+                queue = st.queue.take(200),
+                currentIndex = st.currentIndex,
+                positionMs = st.positionMs,
+                shuffle = st.shuffle,
+                repeatMode = st.repeatMode.name,
+            )
+            queueFile.writeText(queueJson.encodeToString(snapshot))
         }
+    }
+
+    fun persistQueueSnapshot() {
+        if (!persistentQueueProvider()) return
+        scope.launch { writeQueueSnapshotNow() }
     }
 
     fun playSong(song: DesktopSong, loadRadio: Boolean = true) {
@@ -414,9 +431,14 @@ class DesktopAudioPlayer(
         currentSongStartTimeMs = System.currentTimeMillis()
         recordedCurrentPlay = false
         startedCurrentMedia = true
-        scope.launch {
+        playTrackJob?.cancel()
+        playTrackJob = scope.launch {
             runCatching { database.upsertSong(song) }
-            val player = mediaPlayer ?: return@launch
+            val player = mediaPlayer
+            if (player == null) {
+                _state.update { it.copy(isBuffering = false, isPlaying = false) }
+                return@launch
+            }
             val mrl = proxyServer.streamUrlFor(song.id)
             player.media().play(mrl)
             applyVolumeToPlayer()
@@ -429,10 +451,19 @@ class DesktopAudioPlayer(
         }
     }
 
+    private fun needsTrackRestart(player: MediaPlayer): Boolean {
+        val vlcState = runCatching { player.status().state() }.getOrNull()
+        return !startedCurrentMedia ||
+            vlcState == State.NOTHING_SPECIAL ||
+            vlcState == State.STOPPED ||
+            vlcState == State.ENDED ||
+            vlcState == State.ERROR
+    }
+
     fun togglePlayPause() {
         val player = mediaPlayer ?: return
         if (_state.value.currentSong == null) return
-        if (!startedCurrentMedia) {
+        if (needsTrackRestart(player)) {
             startCurrentTrack()
             return
         }
@@ -448,11 +479,13 @@ class DesktopAudioPlayer(
     }
 
     fun resume() {
-        if (!startedCurrentMedia && _state.value.currentSong != null) {
+        val player = mediaPlayer ?: return
+        if (_state.value.currentSong == null) return
+        if (needsTrackRestart(player)) {
             startCurrentTrack()
             return
         }
-        mediaPlayer?.controls()?.setPause(false)
+        player.controls().setPause(false)
     }
 
     fun stop() {
@@ -669,9 +702,19 @@ class DesktopAudioPlayer(
     }
 
     fun release() {
-        persistQueueSnapshot()
+        writeQueueSnapshotNow()
+        playTrackJob?.cancel()
         positionJob?.cancel()
+        scope.cancel()
+        runCatching { mediaPlayer?.audio()?.setEqualizer(null) }
+        runCatching { mediaPlayer?.controls()?.stop() }
         runCatching { audioComponent?.release() }
+        // AudioPlayerComponent(factory) sets ownFactory=false, so factory must be released explicitly.
+        runCatching { mediaPlayerFactory?.release() }
+        vlcEqualizer = null
+        mediaPlayer = null
+        audioComponent = null
+        mediaPlayerFactory = null
     }
 }
 

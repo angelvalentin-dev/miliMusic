@@ -137,7 +137,7 @@ data class DesktopSettings(
     val alarmEntriesJson: String = "",
     val volume: Float = 0.85f,
     val downloadsDir: String = AppPaths.defaultDownloadsDir.absolutePath,
-    val minimizeToTray: Boolean = true,
+    val minimizeToTray: Boolean = false,
     val enableSmtc: Boolean = true,
 ) {
     val isLoggedIn: Boolean get() = cookie.contains("SAPISID")
@@ -212,7 +212,7 @@ class DesktopPreferences(
                 alarmEntriesJson = prefs[DesktopPrefKeys.AlarmEntries] ?: "",
                 volume = prefs[DesktopPrefKeys.Volume] ?: 0.85f,
                 downloadsDir = prefs[DesktopPrefKeys.DownloadsDir] ?: AppPaths.defaultDownloadsDir.absolutePath,
-                minimizeToTray = prefs[DesktopPrefKeys.MinimizeToTray] ?: true,
+                minimizeToTray = prefs[DesktopPrefKeys.MinimizeToTray] ?: false,
                 enableSmtc = prefs[DesktopPrefKeys.EnableSmtc] ?: true,
             )
         }

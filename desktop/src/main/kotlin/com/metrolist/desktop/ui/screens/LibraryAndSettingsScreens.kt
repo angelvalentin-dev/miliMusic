@@ -39,10 +39,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.PrimaryScrollableTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -173,7 +173,10 @@ fun LibraryScreen(
             }
         }
 
-        TabRow(selectedTabIndex = selectedTab.coerceIn(0, tabs.lastIndex)) {
+        PrimaryScrollableTabRow(
+            selectedTabIndex = selectedTab.coerceIn(0, tabs.lastIndex),
+            edgePadding = 16.dp,
+        ) {
             tabs.forEachIndexed { idx, label ->
                 Tab(
                     selected = selectedTab == idx,
@@ -937,7 +940,9 @@ fun SettingsScreen(appState: DesktopAppState) {
                                     scope.launch {
                                         val key = lfmApiKey.ifBlank { System.getenv("LASTFM_API_KEY").orEmpty() }
                                         val sec = lfmSecret.ifBlank { System.getenv("LASTFM_SECRET").orEmpty() }
-                                        DesktopLastFmService.authenticateMobileSession(lfmUserInput, lfmPassInput, key, sec)
+                                        withContext(Dispatchers.IO) {
+                                            DesktopLastFmService.authenticateMobileSession(lfmUserInput, lfmPassInput, key, sec)
+                                        }
                                             .onSuccess { (user, sessionKey) ->
                                                 appState.preferences.set(DesktopPrefKeys.LastFMUsername, user)
                                                 appState.preferences.set(DesktopPrefKeys.LastFMSession, sessionKey)

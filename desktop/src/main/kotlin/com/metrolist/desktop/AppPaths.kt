@@ -29,6 +29,13 @@ object AppPaths {
             ?.takeIf { it.isNotBlank() }
             ?.let(::File)
             ?.takeIf { it.exists() }
+            ?: runCatching {
+                val codeDir = File(AppPaths::class.java.protectionDomain.codeSource.location.toURI()).parentFile
+                listOfNotNull(
+                    codeDir?.let { File(it, "resources") },
+                    codeDir?.parentFile?.let { File(it, "app/resources") },
+                ).firstOrNull { it.exists() }
+            }.getOrNull()
     }
 
     fun bundledFile(relativePath: String): File? {

@@ -44,15 +44,25 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.metrolist.desktop.db.toDesktopSong
@@ -412,6 +422,8 @@ fun SearchScreen(
     var filteredItems by remember { mutableStateOf<List<YTItem>>(emptyList()) }
     var continuation by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
+    var searchError by remember { mutableStateOf<String?>(null) }
+    val searchFocusRequester = remember { FocusRequester() }
 
     LaunchedEffect(query) {
         if (query.isBlank() || query == submittedQuery) {
@@ -430,6 +442,7 @@ fun SearchScreen(
         submittedQuery = cleaned
         query = cleaned
         suggestions = emptyList()
+        searchError = null
         if (!settings.pauseSearchHistory) {
             appState.database.addSearchQuery(cleaned)
         }
@@ -437,20 +450,39 @@ fun SearchScreen(
             loading = true
             continuation = null
             if (tab.filter == null) {
-                summaryPage = YouTube.searchSummary(cleaned).getOrNull()
-                filteredItems = emptyList()
+                YouTube.searchSummary(cleaned)
+                    .onSuccess {
+                        summaryPage = it
+                        filteredItems = emptyList()
+                    }
+                    .onFailure { t ->
+                        summaryPage = null
+                        filteredItems = emptyList()
+                        searchError = t.message ?: "Error al buscar en YouTube Music"
+                    }
             } else {
-                val res = YouTube.search(cleaned, tab.filter).getOrNull()
-                filteredItems = res?.items.orEmpty()
-                continuation = res?.continuation
-                summaryPage = null
+                YouTube.search(cleaned, tab.filter)
+                    .onSuccess { res ->
+                        filteredItems = res.items
+                        continuation = res.continuation
+                        summaryPage = null
+                    }
+                    .onFailure { t ->
+                        filteredItems = emptyList()
+                        summaryPage = null
+                        searchError = t.message ?: "Error al buscar en YouTube Music"
+                    }
             }
             loading = false
         }
     }
 
     LaunchedEffect(initialQuery) {
-        if (initialQuery.isNotBlank()) executeSearch(initialQuery)
+        if (initialQuery.isNotBlank()) {
+            executeSearch(initialQuery)
+        } else {
+            runCatching { searchFocusRequester.requestFocus() }
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
@@ -472,13 +504,26 @@ fun SearchScreen(
                             submittedQuery = ""
                             summaryPage = null
                             filteredItems = emptyList()
+                            searchError = null
                         }) {
                             Icon(Icons.Rounded.Close, "Limpiar búsqueda")
                         }
                     }
                 },
                 singleLine = true,
-                modifier = Modifier.weight(1f),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { executeSearch(query) }),
+                modifier = Modifier
+                    .weight(1f)
+                    .focusRequester(searchFocusRequester)
+                    .onPreviewKeyEvent { ev ->
+                        if (ev.type == KeyEventType.KeyDown && (ev.key == Key.Enter || ev.key == Key.NumPadEnter)) {
+                            executeSearch(query)
+                            true
+                        } else {
+                            false
+                        }
+                    },
             )
             Button(
                 enabled = query.isNotBlank(),
@@ -593,6 +638,34 @@ fun SearchScreen(
             return
         }
 
+        if (searchError != null) {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(searchError!!, color = MaterialTheme.colorScheme.error)
+                Spacer(Modifier.height(10.dp))
+                Button(onClick = { executeSearch(submittedQuery) }) {
+                    Icon(Icons.Rounded.Refresh, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Reintentar")
+                }
+            }
+            return
+        }
+
+        val hasResults = (summaryPage?.summaries?.isNotEmpty() == true) || filteredItems.isNotEmpty()
+        if (submittedQuery.isNotBlank() && !hasResults) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    text = "No se encontraron resultados para \"$submittedQuery\"",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            return
+        }
+
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -639,23 +712,7 @@ fun SearchScreen(
                     }
                     else -> {
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .clickable(
-                                    role = Role.Button,
-                                    onClickLabel = "Abrir ${item.title}",
-                                ) {
-                                    when (item) {
-                                        is AlbumItem -> appState.navigate(NavDestination.Album(item.browseId))
-                                        is ArtistItem -> appState.navigate(NavDestination.Artist(item.id))
-                                        is PlaylistItem -> appState.navigate(NavDestination.Playlist(item.id))
-                                        is PodcastItem -> appState.navigate(NavDestination.Podcast(item.id))
-                                        is EpisodeItem -> Unit
-                                        is SongItem -> Unit
-                                    }
-                                }
-                                .padding(10.dp),
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             YTItemCard(item = item, appState = appState)

@@ -162,12 +162,13 @@ __declspec(dllexport) void __stdcall smtc_update_status(int statusCode) {
 
 __declspec(dllexport) void __stdcall smtc_update_timeline(long long positionMs, long long durationMs) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_initialized || !g_smtc) return;
+    if (!g_initialized || !g_smtc || durationMs <= 0) return;
 
     try {
         SystemMediaTransportControlsTimelineProperties timeline;
-        auto pos = std::chrono::milliseconds(positionMs > 0 ? positionMs : 0);
-        auto dur = std::chrono::milliseconds(durationMs > 0 ? durationMs : 0);
+        long long clampedPos = positionMs > 0 ? (positionMs <= durationMs ? positionMs : durationMs) : 0;
+        auto pos = std::chrono::milliseconds(clampedPos);
+        auto dur = std::chrono::milliseconds(durationMs);
         timeline.StartTime(TimeSpan::zero());
         timeline.MinSeekTime(TimeSpan::zero());
         timeline.Position(pos);
