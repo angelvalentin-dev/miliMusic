@@ -1,6 +1,8 @@
 package com.metrolist.desktop.audio
 
 import com.metrolist.desktop.AppPaths
+import com.metrolist.desktop.data.DesktopLoudnessLevel
+import com.metrolist.desktop.data.DesktopSettings
 import com.metrolist.desktop.db.DesktopDatabase
 import com.metrolist.desktop.db.DesktopSong
 import com.metrolist.desktop.db.toDesktopSong
@@ -34,12 +36,17 @@ import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter
 import uk.co.caprica.vlcj.player.base.State
 import uk.co.caprica.vlcj.player.component.AudioPlayerComponent
 import java.io.File
+import java.time.LocalDateTime
+import java.time.LocalTime
+import kotlin.math.ln
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 enum class RepeatMode { OFF, ALL, ONE }
 
 object DesktopEqPresets {
-    val bandLabels = listOf("31Hz", "63Hz", "125Hz", "250Hz", "500Hz", "1kHz", "2kHz", "4kHz", "8kHz", "16kHz")
+    // True libVLC 10-band center frequencies
+    val bandLabels = DesktopParametricEq.vlcBandLabels
 
     val presets: Map<String, List<Float>> = linkedMapOf(
         "Flat" to listOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f),
@@ -55,6 +62,22 @@ object DesktopEqPresets {
     )
 }
 
+object LoudnessNormalizationMath {
+    /**
+     * Computes linear volume multiplier to align a track's loudnessDb toward target LUFS.
+     * YouTube's loudnessDb is relative to -14 LUFS (positive = louder than -14 LUFS).
+     */
+    fun computeGainFactor(loudnessDb: Double?, targetLevel: DesktopLoudnessLevel): Float {
+        if (loudnessDb == null || !loudnessDb.isFinite()) return 1f
+        val trackLufs = -14.0 + loudnessDb
+        val diffDb = (targetLevel.targetLufs - trackLufs).coerceIn(-12.0, 6.0)
+        return 10.0.pow(diffDb / 20.0).toFloat().coerceIn(0.25f, 1.5f)
+    }
+
+    fun ratioToSemitones(pitchRatio: Float): Float =
+        (12.0 * (ln(pitchRatio.coerceIn(0.5f, 2.0f).toDouble()) / ln(2.0))).toFloat().coerceIn(-12f, 12f)
+}
+
 @Serializable
 data class PersistedQueueSnapshot(
     val queue: List<DesktopSong> = emptyList(),
@@ -66,23 +89,28 @@ data class PersistedQueueSnapshot(
 
 data class PlaybackState(
     val queue: List<DesktopSong> = emptyList(),
+    val automixQueue: List<DesktopSong> = emptyList(),
     val currentIndex: Int = -1,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
     val positionMs: Long = 0L,
     val durationMs: Long = 0L,
+    val accumulatedPlayMs: Long = 0L,
     val volume: Float = 0.85f,
     val isMuted: Boolean = false,
     val shuffle: Boolean = false,
     val repeatMode: RepeatMode = RepeatMode.OFF,
     val playbackSpeed: Float = 1.0f,
+    val playbackPitch: Float = 1.0f,
     val eqEnabled: Boolean = false,
     val eqPreset: String = "Flat",
     val eqPreamp: Float = 0f,
     val eqBands: List<Float> = List(10) { 0f },
+    val normalizationGain: Float = 1f,
     val sleepTimerTargetEpochMs: Long? = null,
     val sleepTimerRemainingMs: Long? = null,
     val sleepTimerEndOfTrack: Boolean = false,
+    val sleepTimerStopAfterTrack: Boolean = false,
     val vlcAvailable: Boolean = true,
     val errorMessage: String? = null,
 ) {
@@ -93,13 +121,14 @@ data class PlaybackState(
 class DesktopAudioPlayer(
     private val database: DesktopDatabase,
     private val proxyServer: StreamProxyServer,
-    private val pauseListenHistoryProvider: () -> Boolean,
-    private val autoplayProvider: () -> Boolean = { true },
-    private val persistentQueueProvider: () -> Boolean = { true },
+    private val settingsProvider: () -> DesktopSettings = { DesktopSettings() },
     private val queueFile: File = File(AppPaths.dataDir, "playback_queue.json"),
-    private val onVolumePersist: (Float) -> Unit,
+    private val onVolumePersist: (Float) -> Unit = {},
     private val onSpeedPersist: (Float) -> Unit = {},
+    private val onPitchPersist: (Float) -> Unit = {},
     private val onEqPersist: (Boolean, String, Float, List<Float>) -> Unit = { _, _, _, _ -> },
+    private val onSeekBroadcast: (Long) -> Unit = {},
+    private val onQueueBroadcast: (List<DesktopSong>, Int) -> Unit = { _, _ -> },
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _state = MutableStateFlow(PlaybackState())
@@ -112,15 +141,22 @@ class DesktopAudioPlayer(
     private var vlcEqualizer: Equalizer? = null
     private var positionJob: Job? = null
     private var playTrackJob: Job? = null
-    private var currentSongStartTimeMs: Long = 0L
     private var recordedCurrentPlay: Boolean = false
     private var pendingRestoredSeekMs: Long = 0L
     private var startedCurrentMedia: Boolean = false
     private var fetchingAutoplay: Boolean = false
+    private var restoredQueueOnce: Boolean = false
+    private var crossfadeActive: Boolean = false
+    private var crossfadeScale: Float = 1f
+    private var sleepFadeScale: Float = 1f
+    private var lastAutoSleepCheckMin: Int = -1
+    private var lastScheduledSleepDateKey: String = ""
+    private var consecutiveErrors: Int = 0
+    private var pausedByMute: Boolean = false
+    private var shuffleHistory = ArrayDeque<Int>()
 
     init {
         initVlc()
-        restorePersistedQueue()
         startPositionTicker()
     }
 
@@ -154,6 +190,7 @@ class DesktopAudioPlayer(
             player.events().addMediaPlayerEventListener(
                 object : MediaPlayerEventAdapter() {
                     override fun playing(mediaPlayer: MediaPlayer) {
+                        consecutiveErrors = 0
                         _state.update { it.copy(isPlaying = true, isBuffering = false, errorMessage = null) }
                         if (pendingRestoredSeekMs > 0L) {
                             val target = pendingRestoredSeekMs
@@ -162,10 +199,12 @@ class DesktopAudioPlayer(
                         }
                         applySpeedToPlayer()
                         applyEqualizerToPlayer()
+                        applyVolumeToPlayer()
                     }
 
                     override fun paused(mediaPlayer: MediaPlayer) {
                         _state.update { it.copy(isPlaying = false, isBuffering = false) }
+                        saveEpisodePositionIfNeeded()
                         persistQueueSnapshot()
                     }
 
@@ -195,6 +234,13 @@ class DesktopAudioPlayer(
                                 errorMessage = "Error al reproducir la pista",
                             )
                         }
+                        if (settingsProvider().autoSkipNextOnError && consecutiveErrors < 3) {
+                            consecutiveErrors += 1
+                            scope.launch {
+                                delay(600L)
+                                next()
+                            }
+                        }
                     }
                 },
             )
@@ -221,40 +267,74 @@ class DesktopAudioPlayer(
             while (isActive) {
                 val player = mediaPlayer
                 val st = _state.value
+                val cfg = settingsProvider()
+
+                // Scheduled automatic sleep timer check (once per minute)
+                checkScheduledSleepTimer(cfg, st)
+
+                // Active sleep timer countdown + optional 60s gradual fade-out
                 val targetSleep = st.sleepTimerTargetEpochMs
                 if (targetSleep != null) {
                     val remaining = targetSleep - System.currentTimeMillis()
                     if (remaining <= 0L) {
-                        pause()
-                        _state.update {
-                            it.copy(
-                                sleepTimerTargetEpochMs = null,
-                                sleepTimerRemainingMs = null,
-                                sleepTimerEndOfTrack = false,
-                            )
+                        sleepFadeScale = 1f
+                        if (st.sleepTimerStopAfterTrack && st.isPlaying) {
+                            _state.update {
+                                it.copy(
+                                    sleepTimerTargetEpochMs = null,
+                                    sleepTimerRemainingMs = null,
+                                    sleepTimerEndOfTrack = true,
+                                    sleepTimerStopAfterTrack = false,
+                                )
+                            }
+                        } else {
+                            pause()
+                            _state.update {
+                                it.copy(
+                                    sleepTimerTargetEpochMs = null,
+                                    sleepTimerRemainingMs = null,
+                                    sleepTimerEndOfTrack = false,
+                                    sleepTimerStopAfterTrack = false,
+                                )
+                            }
                         }
+                        applyVolumeToPlayer()
                     } else {
+                        if (cfg.sleepTimerFadeOut && remaining <= 60_000L && !st.sleepTimerStopAfterTrack) {
+                            sleepFadeScale = (remaining / 60_000f).coerceIn(0.05f, 1f)
+                            applyVolumeToPlayer()
+                        } else if (sleepFadeScale != 1f) {
+                            sleepFadeScale = 1f
+                            applyVolumeToPlayer()
+                        }
                         _state.update { it.copy(sleepTimerRemainingMs = remaining) }
                     }
+                } else if (sleepFadeScale != 1f) {
+                    sleepFadeScale = 1f
+                    applyVolumeToPlayer()
                 }
 
                 if (player != null && st.isPlaying) {
                     val time = player.status().time().coerceAtLeast(0L)
                     val len = player.status().length().takeIf { it > 0L }
                         ?: ((st.currentSong?.duration ?: 0) * 1000L).coerceAtLeast(0L)
-                    _state.update { it.copy(positionMs = time, durationMs = len) }
+                    val newAccum = st.accumulatedPlayMs + 250L
+                    _state.update { it.copy(positionMs = time, durationMs = len, accumulatedPlayMs = newAccum) }
 
                     val current = st.currentSong
-                    if (!recordedCurrentPlay && current != null && !pauseListenHistoryProvider()) {
-                        if (System.currentTimeMillis() - currentSongStartTimeMs >= 8_000L) {
-                            recordedCurrentPlay = true
-                            val playDuration = len.takeIf { it > 0L } ?: 180_000L
-                            runCatching { database.recordPlay(current, playDuration.coerceAtLeast(8_000L)) }
-                        }
+                    val historyThresholdMs = (cfg.historyDurationSec * 1000f).toLong().coerceAtLeast(1_000L)
+                    if (!recordedCurrentPlay && current != null && !cfg.pauseListenHistory && newAccum >= historyThresholdMs) {
+                        recordedCurrentPlay = true
+                        val playDuration = len.takeIf { it > 0L } ?: 180_000L
+                        runCatching { database.recordPlay(current, playDuration.coerceAtLeast(historyThresholdMs)) }
                     }
+
+                    // Smooth software crossfade near end of track
+                    handleCrossfadeTick(cfg, st, time, len)
 
                     tickCount += 1
                     if (tickCount % 20 == 0) {
+                        saveEpisodePositionIfNeeded()
                         persistQueueSnapshot()
                     }
                 }
@@ -263,8 +343,84 @@ class DesktopAudioPlayer(
         }
     }
 
-    fun restorePersistedQueue() {
-        if (!persistentQueueProvider() || !queueFile.exists()) return
+    private fun handleCrossfadeTick(cfg: DesktopSettings, st: PlaybackState, posMs: Long, lenMs: Long) {
+        if (!cfg.crossfadeEnabled || lenMs <= 15_000L || st.repeatMode == RepeatMode.ONE) {
+            if (crossfadeScale != 1f) {
+                crossfadeScale = 1f
+                applyVolumeToPlayer()
+            }
+            return
+        }
+        val nextIdx = computeNextIndex(st) ?: return
+        val currAlbum = st.currentSong?.albumId
+        val nextAlbum = st.queue.getOrNull(nextIdx)?.albumId
+        if (cfg.crossfadeGapless && !currAlbum.isNullOrBlank() && currAlbum == nextAlbum) {
+            return
+        }
+        val fadeMs = (cfg.crossfadeDurationSec * 1000f).toLong().coerceIn(1_000L, 15_000L)
+        val remaining = lenMs - posMs
+        if (remaining in 1L..fadeMs) {
+            crossfadeScale = (remaining.toFloat() / fadeMs.toFloat()).coerceIn(0.08f, 1f)
+            applyVolumeToPlayer()
+            if (remaining <= 450L && !crossfadeActive) {
+                crossfadeActive = true
+                scope.launch {
+                    jumpToIndex(nextIdx, fadeInMs = (fadeMs / 2L).coerceIn(400L, 3000L))
+                    crossfadeActive = false
+                }
+            }
+        } else if (crossfadeScale != 1f && !crossfadeActive) {
+            crossfadeScale = 1f
+            applyVolumeToPlayer()
+        }
+    }
+
+    private fun checkScheduledSleepTimer(cfg: DesktopSettings, st: PlaybackState) {
+        if (!cfg.sleepTimerEnabled || !st.isPlaying || st.sleepTimerTargetEpochMs != null) return
+        val now = LocalDateTime.now()
+        val minuteOfDay = now.hour * 60 + now.minute
+        if (minuteOfDay == lastAutoSleepCheckMin) return
+        lastAutoSleepCheckMin = minuteOfDay
+
+        val dayOfWeek = now.dayOfWeek.value // 1=Mon..7=Sun
+        if (cfg.sleepTimerRepeat == "CUSTOM" && dayOfWeek !in cfg.sleepTimerCustomDays) return
+
+        val start = parseLocalTime(cfg.sleepTimerStartTime) ?: return
+        val end = parseLocalTime(cfg.sleepTimerEndTime) ?: return
+        val cur = now.toLocalTime()
+        val inWindow = if (start <= end) cur >= start && cur < end else cur >= start || cur < end
+        val dateKey = "${now.toLocalDate()}_${cfg.sleepTimerStartTime}"
+        if (inWindow && dateKey != lastScheduledSleepDateKey) {
+            lastScheduledSleepDateKey = dateKey
+            setSleepTimer(
+                minutes = cfg.sleepTimerDefaultMinutes.coerceAtLeast(1),
+                endOfTrack = false,
+                stopAfterCurrentSong = cfg.sleepTimerStopAfterCurrentSong,
+            )
+        }
+    }
+
+    private fun parseLocalTime(raw: String): LocalTime? {
+        val parts = raw.trim().split(":")
+        val h = parts.getOrNull(0)?.toIntOrNull() ?: return null
+        val m = parts.getOrNull(1)?.toIntOrNull() ?: return null
+        return runCatching { LocalTime.of(h, m) }.getOrNull()
+    }
+
+    private fun saveEpisodePositionIfNeeded() {
+        val st = _state.value
+        val song = st.currentSong ?: return
+        if (song.isEpisode && st.positionMs > 2_000L) {
+            val pos = if (st.durationMs > 0L && st.durationMs - st.positionMs < 5_000L) null else st.positionMs
+            runCatching { database.setEpisodePlaybackPosition(song.id, pos) }
+        }
+    }
+
+    fun restorePersistedQueueIfEnabled() {
+        if (restoredQueueOnce) return
+        restoredQueueOnce = true
+        val cfg = settingsProvider()
+        if (!cfg.persistentQueue || !queueFile.exists()) return
         runCatching {
             val snapshot = queueJson.decodeFromString<PersistedQueueSnapshot>(queueFile.readText())
             if (snapshot.queue.isEmpty()) return
@@ -278,8 +434,10 @@ class DesktopAudioPlayer(
                     currentIndex = safeIdx,
                     positionMs = snapshot.positionMs.coerceAtLeast(0L),
                     durationMs = (song.duration.coerceAtLeast(0)) * 1000L,
-                    shuffle = snapshot.shuffle,
-                    repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeatMode) }.getOrDefault(RepeatMode.OFF),
+                    shuffle = if (cfg.rememberShuffleAndRepeat) snapshot.shuffle else false,
+                    repeatMode = if (cfg.rememberShuffleAndRepeat) {
+                        runCatching { RepeatMode.valueOf(snapshot.repeatMode) }.getOrDefault(RepeatMode.OFF)
+                    } else RepeatMode.OFF,
                     isPlaying = false,
                     isBuffering = false,
                 )
@@ -287,8 +445,14 @@ class DesktopAudioPlayer(
         }
     }
 
+    // Kept for backwards compatibility with existing tests
+    fun restorePersistedQueue() {
+        restoredQueueOnce = false
+        restorePersistedQueueIfEnabled()
+    }
+
     private fun writeQueueSnapshotNow() {
-        if (!persistentQueueProvider()) return
+        if (!settingsProvider().persistentQueue) return
         val st = _state.value
         runCatching {
             queueFile.parentFile?.mkdirs()
@@ -304,7 +468,7 @@ class DesktopAudioPlayer(
     }
 
     fun persistQueueSnapshot() {
-        if (!persistentQueueProvider()) return
+        if (!settingsProvider().persistentQueue) return
         scope.launch { writeQueueSnapshotNow() }
     }
 
@@ -312,25 +476,45 @@ class DesktopAudioPlayer(
         playQueue(listOf(song), startIndex = 0, loadRadio = loadRadio)
     }
 
-    fun playQueue(songs: List<DesktopSong>, startIndex: Int = 0, loadRadio: Boolean = false) {
+    fun playQueue(
+        songs: List<DesktopSong>,
+        startIndex: Int = 0,
+        loadRadio: Boolean = false,
+        shuffled: Boolean = false,
+    ) {
         if (songs.isEmpty()) return
-        val safeIndex = startIndex.coerceIn(0, songs.lastIndex)
+        val cfg = settingsProvider()
+        val deduped = if (cfg.preventDuplicateTracksInQueue) songs.distinctBy { it.id } else songs
+        val finalQueue = if (shuffled && cfg.shufflePlaylistFirst) deduped.shuffled() else deduped
+        val safeIndex = if (shuffled && cfg.shufflePlaylistFirst) 0 else startIndex.coerceIn(0, finalQueue.lastIndex)
         pendingRestoredSeekMs = 0L
+        shuffleHistory.clear()
+        val keepShuffle = if (shuffled) true else if (cfg.persistentShuffleAcrossQueues) _state.value.shuffle else false
         _state.update {
             it.copy(
-                queue = songs,
+                queue = finalQueue,
                 currentIndex = safeIndex,
                 positionMs = 0L,
-                durationMs = (songs[safeIndex].duration.coerceAtLeast(0)) * 1000L,
+                accumulatedPlayMs = 0L,
+                durationMs = (finalQueue[safeIndex].duration.coerceAtLeast(0)) * 1000L,
+                shuffle = keepShuffle,
                 isBuffering = true,
                 errorMessage = null,
             )
         }
-        startCurrentTrack()
+        startCurrentTrack(allowAutoLoadRadio = loadRadio)
         persistQueueSnapshot()
-        if ((loadRadio || autoplayProvider()) && songs.size == 1) {
-            fetchAndAppendRadio(songs.first())
+        onQueueBroadcast(finalQueue, safeIndex)
+        if (loadRadio && finalQueue.size == 1) {
+            fetchAndAppendRadio(finalQueue.first())
         }
+        if (cfg.similarContent) {
+            fetchAutomixSuggestions(finalQueue[safeIndex])
+        }
+    }
+
+    fun startRadioSeamlessly(seed: DesktopSong) {
+        fetchAndAppendRadio(seed, playFirstFetched = false)
     }
 
     private fun fetchAndAppendRadio(seed: DesktopSong, playFirstFetched: Boolean = false) {
@@ -359,11 +543,27 @@ class DesktopAudioPlayer(
         }
     }
 
+    private fun fetchAutomixSuggestions(seed: DesktopSong) {
+        scope.launch {
+            val existingIds = _state.value.queue.map { it.id }.toSet()
+            val nextResult = runCatching { YouTube.next(WatchEndpoint(videoId = seed.id)).getOrNull() }.getOrNull()
+            val items = nextResult?.items?.map { it.toDesktopSong() }
+                ?.filter { it.id !in existingIds && it.id != seed.id }
+                ?.take(15)
+                .orEmpty()
+            if (items.isNotEmpty()) {
+                _state.update { it.copy(automixQueue = items) }
+            }
+        }
+    }
+
     fun playNext(song: DesktopSong) {
+        val preventDup = settingsProvider().preventDuplicateTracksInQueue
         _state.update { st ->
             if (st.queue.isEmpty()) {
                 return@update st.copy(queue = listOf(song), currentIndex = 0)
             }
+            if (preventDup && st.queue.any { it.id == song.id }) return@update st
             val insertAt = (st.currentIndex + 1).coerceAtMost(st.queue.size)
             val updated = st.queue.toMutableList().apply { add(insertAt, song) }
             st.copy(queue = updated)
@@ -373,13 +573,35 @@ class DesktopAudioPlayer(
     }
 
     fun addToQueue(song: DesktopSong) {
+        val preventDup = settingsProvider().preventDuplicateTracksInQueue
         val wasEmpty = _state.value.queue.isEmpty()
         _state.update { st ->
+            if (preventDup && st.queue.any { it.id == song.id }) return@update st
             val updated = st.queue + song
             st.copy(queue = updated, currentIndex = if (wasEmpty) 0 else st.currentIndex)
         }
         persistQueueSnapshot()
         if (wasEmpty) startCurrentTrack()
+    }
+
+    fun addAllToQueue(songs: List<DesktopSong>) {
+        if (songs.isEmpty()) return
+        val preventDup = settingsProvider().preventDuplicateTracksInQueue
+        val wasEmpty = _state.value.queue.isEmpty()
+        _state.update { st ->
+            val existing = if (preventDup) st.queue.map { it.id }.toSet() else emptySet()
+            val toAdd = songs.filter { it.id !in existing }
+            if (toAdd.isEmpty()) return@update st
+            st.copy(queue = st.queue + toAdd, currentIndex = if (wasEmpty) 0 else st.currentIndex)
+        }
+        persistQueueSnapshot()
+        if (wasEmpty) startCurrentTrack()
+    }
+
+    fun clearQueue() {
+        stop()
+        _state.update { it.copy(queue = emptyList(), currentIndex = -1, positionMs = 0L, durationMs = 0L, accumulatedPlayMs = 0L) }
+        persistQueueSnapshot()
     }
 
     fun removeFromQueue(index: Int) {
@@ -418,37 +640,100 @@ class DesktopAudioPlayer(
         persistQueueSnapshot()
     }
 
-    fun jumpToIndex(index: Int) {
+    fun jumpToIndex(index: Int, fadeInMs: Long = 0L) {
         if (index !in _state.value.queue.indices) return
+        saveEpisodePositionIfNeeded()
         pendingRestoredSeekMs = 0L
-        _state.update { it.copy(currentIndex = index, positionMs = 0L, isBuffering = true) }
-        startCurrentTrack()
+        _state.update { it.copy(currentIndex = index, positionMs = 0L, accumulatedPlayMs = 0L, isBuffering = true) }
+        startCurrentTrack(fadeInMs = fadeInMs)
         persistQueueSnapshot()
     }
 
-    private fun startCurrentTrack() {
+    private fun startCurrentTrack(allowAutoLoadRadio: Boolean = true, fadeInMs: Long = 0L) {
         val song = _state.value.currentSong ?: return
-        currentSongStartTimeMs = System.currentTimeMillis()
         recordedCurrentPlay = false
         startedCurrentMedia = true
         playTrackJob?.cancel()
         playTrackJob = scope.launch {
             runCatching { database.upsertSong(song) }
+            val storedSong = runCatching { database.getSong(song.id) }.getOrNull()
+            if (song.isEpisode && (storedSong?.playbackPosition ?: 0L) > 5_000L && pendingRestoredSeekMs == 0L) {
+                pendingRestoredSeekMs = storedSong!!.playbackPosition!!
+            }
+
+            // Compute loudness normalization factor from cached format metadata
+            val cfg = settingsProvider()
+            val fmt = runCatching { database.getFormat(song.id) }.getOrNull()
+            val normGain = if (cfg.audioNormalization) {
+                LoudnessNormalizationMath.computeGainFactor(fmt?.loudnessDb, cfg.loudnessLevel)
+            } else 1f
+            _state.update { it.copy(normalizationGain = normGain) }
+
             val player = mediaPlayer
             if (player == null) {
                 _state.update { it.copy(isBuffering = false, isPlaying = false) }
                 return@launch
             }
             val mrl = proxyServer.streamUrlFor(song.id)
-            player.media().play(mrl)
+            val options = buildMediaOptions(cfg)
+            if (fadeInMs > 0L) {
+                crossfadeScale = 0.1f
+            } else {
+                crossfadeScale = 1f
+            }
+            if (options.isEmpty()) {
+                player.media().play(mrl)
+            } else {
+                player.media().play(mrl, *options.toTypedArray())
+            }
             applyVolumeToPlayer()
             applySpeedToPlayer()
             applyEqualizerToPlayer()
+
+            if (fadeInMs > 0L) {
+                val steps = 10
+                val stepDelay = (fadeInMs / steps).coerceAtLeast(40L)
+                for (i in 1..steps) {
+                    delay(stepDelay)
+                    crossfadeScale = (i.toFloat() / steps.toFloat()).coerceIn(0.1f, 1f)
+                    applyVolumeToPlayer()
+                }
+            }
+
+            // Re-check loudness once stream resolver populates format in background
+            delay(1_200L)
+            val refreshedFmt = runCatching { database.getFormat(song.id) }.getOrNull()
+            if (refreshedFmt?.loudnessDb != null && settingsProvider().audioNormalization) {
+                val updatedGain = LoudnessNormalizationMath.computeGainFactor(refreshedFmt.loudnessDb, settingsProvider().loudnessLevel)
+                _state.update { it.copy(normalizationGain = updatedGain) }
+                applyVolumeToPlayer()
+            }
         }
         val st = _state.value
-        if (autoplayProvider() && st.currentIndex == st.queue.lastIndex && st.queue.isNotEmpty()) {
+        val cfg = settingsProvider()
+        val canAutoLoad = allowAutoLoadRadio && cfg.autoplay && cfg.autoLoadMore &&
+            !(cfg.disableLoadMoreWhenRepeatAll && st.repeatMode == RepeatMode.ALL)
+        if (canAutoLoad && st.currentIndex == st.queue.lastIndex && st.queue.isNotEmpty()) {
             fetchAndAppendRadio(song, playFirstFetched = false)
         }
+    }
+
+    private fun buildMediaOptions(cfg: DesktopSettings): List<String> {
+        val opts = mutableListOf<String>()
+        val filters = mutableListOf<String>()
+        val pitch = _state.value.playbackPitch
+        if (!cfg.varispeed && kotlin.math.abs(pitch - 1.0f) > 0.02f) {
+            val semitones = LoudnessNormalizationMath.ratioToSemitones(pitch)
+            filters += "scaletempo_pitch"
+            opts += ":pitch-shift=$semitones"
+        }
+        if (cfg.skipSilence) {
+            filters += "compressor"
+        }
+        if (filters.isNotEmpty()) {
+            opts += ":audio-filter=${filters.joinToString(":")}"
+        }
+        return opts
     }
 
     private fun needsTrackRestart(player: MediaPlayer): Boolean {
@@ -489,11 +774,12 @@ class DesktopAudioPlayer(
     }
 
     fun stop() {
+        saveEpisodePositionIfNeeded()
         mediaPlayer?.controls()?.stop()
         _state.update { it.copy(isPlaying = false, isBuffering = false, positionMs = 0L) }
     }
 
-    fun seekTo(positionMs: Long) {
+    fun seekTo(positionMs: Long, broadcast: Boolean = true) {
         val player = mediaPlayer ?: return
         val target = positionMs.coerceAtLeast(0L)
         if (!startedCurrentMedia) {
@@ -503,25 +789,35 @@ class DesktopAudioPlayer(
         }
         player.controls().setTime(target)
         _state.update { it.copy(positionMs = target) }
+        if (broadcast) onSeekBroadcast(target)
+    }
+
+    fun seekRelative(deltaMs: Long) {
+        val st = _state.value
+        val target = (st.positionMs + deltaMs).coerceIn(0L, st.durationMs.coerceAtLeast(1L))
+        seekTo(target)
+    }
+
+    private fun computeNextIndex(st: PlaybackState): Int? = when {
+        st.shuffle && st.queue.size > 1 -> st.queue.indices.filter { it != st.currentIndex }.randomOrNull()
+        st.currentIndex + 1 < st.queue.size -> st.currentIndex + 1
+        st.repeatMode == RepeatMode.ALL && st.queue.isNotEmpty() -> 0
+        else -> null
     }
 
     fun next() {
         val st = _state.value
         if (st.queue.isEmpty()) return
-        val nextIndex = when {
-            st.shuffle && st.queue.size > 1 -> {
-                val candidates = st.queue.indices.filter { it != st.currentIndex }
-                candidates.random()
-            }
-            st.currentIndex + 1 < st.queue.size -> st.currentIndex + 1
-            st.repeatMode == RepeatMode.ALL -> 0
-            autoplayProvider() && st.currentSong != null -> {
-                fetchAndAppendRadio(st.currentSong!!, playFirstFetched = true)
-                return
-            }
-            else -> return
+        if (st.currentIndex in st.queue.indices) {
+            shuffleHistory.addLast(st.currentIndex)
+            if (shuffleHistory.size > 50) shuffleHistory.removeFirst()
         }
-        jumpToIndex(nextIndex)
+        val nextIndex = computeNextIndex(st)
+        if (nextIndex != null) {
+            jumpToIndex(nextIndex)
+        } else if (settingsProvider().autoplay && st.currentSong != null) {
+            fetchAndAppendRadio(st.currentSong!!, playFirstFetched = true)
+        }
     }
 
     fun previous() {
@@ -532,6 +828,7 @@ class DesktopAudioPlayer(
             return
         }
         val prevIndex = when {
+            st.shuffle && shuffleHistory.isNotEmpty() -> shuffleHistory.removeLast().coerceIn(0, st.queue.lastIndex)
             st.currentIndex - 1 >= 0 -> st.currentIndex - 1
             st.repeatMode == RepeatMode.ALL -> st.queue.lastIndex
             else -> {
@@ -544,6 +841,9 @@ class DesktopAudioPlayer(
 
     private fun onTrackFinished() {
         val st = _state.value
+        st.currentSong?.takeIf { it.isEpisode }?.let {
+            runCatching { database.setEpisodePlaybackPosition(it.id, null) }
+        }
         if (st.sleepTimerEndOfTrack) {
             _state.update {
                 it.copy(
@@ -551,21 +851,20 @@ class DesktopAudioPlayer(
                     sleepTimerEndOfTrack = false,
                     sleepTimerTargetEpochMs = null,
                     sleepTimerRemainingMs = null,
+                    sleepTimerStopAfterTrack = false,
                 )
             }
             return
         }
         if (st.repeatMode == RepeatMode.ONE) {
-            seekTo(0L)
+            seekTo(0L, broadcast = false)
             startCurrentTrack()
             return
         }
-        val hasNext = st.shuffle && st.queue.size > 1 ||
-            st.currentIndex + 1 < st.queue.size ||
-            st.repeatMode == RepeatMode.ALL
+        val hasNext = computeNextIndex(st) != null
         if (hasNext) {
             next()
-        } else if (autoplayProvider() && st.currentSong != null) {
+        } else if (settingsProvider().autoplay && st.currentSong != null) {
             fetchAndAppendRadio(st.currentSong!!, playFirstFetched = true)
         } else {
             _state.update { it.copy(isPlaying = false, positionMs = it.durationMs) }
@@ -574,14 +873,35 @@ class DesktopAudioPlayer(
 
     fun setVolume(volume: Float, persist: Boolean = true) {
         val clamped = volume.coerceIn(0f, 1f)
-        _state.update { it.copy(volume = clamped, isMuted = clamped == 0f) }
+        val wasMuted = _state.value.isMuted
+        val nowMuted = clamped == 0f
+        _state.update { it.copy(volume = clamped, isMuted = nowMuted) }
         applyVolumeToPlayer()
+        if (settingsProvider().pauseOnMute) {
+            if (nowMuted && _state.value.isPlaying) {
+                pausedByMute = true
+                pause()
+            } else if (!nowMuted && wasMuted && pausedByMute) {
+                pausedByMute = false
+                resume()
+            }
+        }
         if (persist) onVolumePersist(clamped)
     }
 
     fun toggleMute() {
-        _state.update { it.copy(isMuted = !it.isMuted) }
+        val nextMuted = !_state.value.isMuted
+        _state.update { it.copy(isMuted = nextMuted) }
         applyVolumeToPlayer()
+        if (settingsProvider().pauseOnMute) {
+            if (nextMuted && _state.value.isPlaying) {
+                pausedByMute = true
+                pause()
+            } else if (!nextMuted && pausedByMute) {
+                pausedByMute = false
+                resume()
+            }
+        }
     }
 
     fun toggleShuffle() {
@@ -606,6 +926,18 @@ class DesktopAudioPlayer(
         _state.update { it.copy(playbackSpeed = clamped) }
         applySpeedToPlayer()
         if (persist) onSpeedPersist(clamped)
+    }
+
+    fun setPlaybackPitch(pitch: Float, persist: Boolean = true) {
+        val clamped = pitch.coerceIn(0.5f, 2.0f)
+        val changed = kotlin.math.abs(_state.value.playbackPitch - clamped) > 0.01f
+        _state.update { it.copy(playbackPitch = clamped) }
+        if (persist) onPitchPersist(clamped)
+        if (changed && _state.value.isPlaying && startedCurrentMedia) {
+            val pos = _state.value.positionMs
+            pendingRestoredSeekMs = pos
+            startCurrentTrack(allowAutoLoadRadio = false)
+        }
     }
 
     fun setEqualizer(
@@ -634,7 +966,16 @@ class DesktopAudioPlayer(
         setEqualizer(enabled = true, preset = presetName, preamp = _state.value.eqPreamp, bands = bands)
     }
 
-    fun setSleepTimer(minutes: Int?, endOfTrack: Boolean = false) {
+    fun applyParametricProfile(profile: ParametricEqProfile, name: String) {
+        val (preamp, bands) = DesktopParametricEq.projectToVlc10Bands(profile)
+        setEqualizer(enabled = true, preset = name, preamp = preamp, bands = bands)
+    }
+
+    fun setSleepTimer(
+        minutes: Int?,
+        endOfTrack: Boolean = false,
+        stopAfterCurrentSong: Boolean = settingsProvider().sleepTimerStopAfterCurrentSong,
+    ) {
         when {
             endOfTrack -> {
                 _state.update {
@@ -642,6 +983,7 @@ class DesktopAudioPlayer(
                         sleepTimerEndOfTrack = true,
                         sleepTimerTargetEpochMs = null,
                         sleepTimerRemainingMs = null,
+                        sleepTimerStopAfterTrack = false,
                     )
                 }
             }
@@ -652,25 +994,41 @@ class DesktopAudioPlayer(
                         sleepTimerEndOfTrack = false,
                         sleepTimerTargetEpochMs = System.currentTimeMillis() + durationMs,
                         sleepTimerRemainingMs = durationMs,
+                        sleepTimerStopAfterTrack = stopAfterCurrentSong,
                     )
                 }
             }
             else -> {
+                sleepFadeScale = 1f
+                applyVolumeToPlayer()
                 _state.update {
                     it.copy(
                         sleepTimerEndOfTrack = false,
                         sleepTimerTargetEpochMs = null,
                         sleepTimerRemainingMs = null,
+                        sleepTimerStopAfterTrack = false,
                     )
                 }
             }
         }
     }
 
+    fun reapplyNormalization() {
+        val song = _state.value.currentSong ?: return
+        val cfg = settingsProvider()
+        val fmt = runCatching { database.getFormat(song.id) }.getOrNull()
+        val gain = if (cfg.audioNormalization) {
+            LoudnessNormalizationMath.computeGainFactor(fmt?.loudnessDb, cfg.loudnessLevel)
+        } else 1f
+        _state.update { it.copy(normalizationGain = gain) }
+        applyVolumeToPlayer()
+    }
+
     private fun applyVolumeToPlayer() {
         val player = mediaPlayer ?: return
         val st = _state.value
-        val vlcVolume = if (st.isMuted) 0 else (st.volume * 100f).roundToInt().coerceIn(0, 100)
+        val effective = (st.volume * st.normalizationGain * crossfadeScale * sleepFadeScale).coerceIn(0f, 1.25f)
+        val vlcVolume = if (st.isMuted) 0 else (effective * 100f).roundToInt().coerceIn(0, 125)
         runCatching {
             player.audio().setMute(st.isMuted)
             player.audio().setVolume(vlcVolume)
@@ -702,6 +1060,7 @@ class DesktopAudioPlayer(
     }
 
     fun release() {
+        saveEpisodePositionIfNeeded()
         writeQueueSnapshotNow()
         playTrackJob?.cancel()
         positionJob?.cancel()
@@ -709,7 +1068,6 @@ class DesktopAudioPlayer(
         runCatching { mediaPlayer?.audio()?.setEqualizer(null) }
         runCatching { mediaPlayer?.controls()?.stop() }
         runCatching { audioComponent?.release() }
-        // AudioPlayerComponent(factory) sets ownFactory=false, so factory must be released explicitly.
         runCatching { mediaPlayerFactory?.release() }
         vlcEqualizer = null
         mediaPlayer = null
@@ -717,4 +1075,3 @@ class DesktopAudioPlayer(
         mediaPlayerFactory = null
     }
 }
-

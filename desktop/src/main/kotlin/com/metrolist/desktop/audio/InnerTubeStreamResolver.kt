@@ -2,6 +2,7 @@ package com.metrolist.desktop.audio
 
 import com.metrolist.desktop.AppPaths
 import com.metrolist.desktop.data.DesktopAudioQuality
+import com.metrolist.desktop.db.DesktopFormatInfo
 import com.metrolist.innertube.YouTube
 import com.metrolist.innertubex.InnerTubeLogLevel
 import com.metrolist.innertubex.InnerTubeLogger
@@ -24,22 +25,44 @@ import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.Properties
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.time.Clock
 
 data class ResolvedStream(
     val videoId: String,
     val url: String,
     val headers: Map<String, String>,
     val mimeType: String,
+    val codecs: String = "",
+    val itag: Int = 0,
+    val bitrate: Int = 0,
+    val sampleRate: Int? = null,
     val contentLengthBytes: Long?,
+    val loudnessDb: Double? = null,
+    val perceptualLoudnessDb: Double? = null,
+    val playbackTrackingUrl: String? = null,
     val expiresAtMs: Long,
     val clientName: String,
     val requireBoundedRange: Boolean,
     val rangeChunkSizeBytes: Long,
     val useRangeChunks: Boolean,
-)
+) {
+    fun toFormatInfo(): DesktopFormatInfo =
+        DesktopFormatInfo(
+            id = videoId,
+            itag = itag,
+            mimeType = mimeType,
+            codecs = codecs,
+            bitrate = bitrate,
+            sampleRate = sampleRate,
+            contentLength = contentLengthBytes ?: 0L,
+            loudnessDb = loudnessDb,
+            perceptualLoudnessDb = perceptualLoudnessDb,
+            playbackUrl = playbackTrackingUrl,
+        )
+}
 
-class InnerTubeStreamResolver {
+class InnerTubeStreamResolver(
+    private val onFormatResolved: (DesktopFormatInfo) -> Unit = {},
+) {
     private val bundleMutex = Mutex()
 
     @Volatile
@@ -79,6 +102,7 @@ class InnerTubeStreamResolver {
 
             val resolved = stream.toResolvedStream()
             cache[videoId] = resolved
+            runCatching { onFormatResolved(resolved.toFormatInfo()) }
             Result.success(resolved)
         } catch (ce: CancellationException) {
             throw ce
@@ -86,6 +110,8 @@ class InnerTubeStreamResolver {
             Result.failure(t)
         }
     }
+
+    fun getCachedStream(videoId: String): ResolvedStream? = cache[videoId]
 
     fun markClientFailed(videoId: String, clientName: String) {
         val now = System.currentTimeMillis()
@@ -164,7 +190,14 @@ class InnerTubeStreamResolver {
             url = audioUrl,
             headers = headers,
             mimeType = mimeType.orEmpty().ifBlank { "audio/webm" },
+            codecs = codecs.orEmpty(),
+            itag = itag,
+            bitrate = bitrate ?: 0,
+            sampleRate = sampleRate,
             contentLengthBytes = contentLengthBytes,
+            loudnessDb = loudnessDb,
+            perceptualLoudnessDb = perceptualLoudnessDb,
+            playbackTrackingUrl = playbackTracking?.playbackUrl,
             expiresAtMs = expiresAtMs,
             clientName = clientName,
             requireBoundedRange = requireBoundedRange,

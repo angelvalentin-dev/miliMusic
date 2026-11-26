@@ -22,6 +22,7 @@ class StreamProxyServer(
     private val qualityProvider: () -> DesktopAudioQuality,
     private val downloadsDirProvider: () -> File,
     private val cacheEnabledProvider: () -> Boolean,
+    private val maxCacheSizeMbProvider: () -> Int = { 1024 },
     private val cacheDirProvider: () -> File = { AppPaths.songCacheDir },
     private val onSongCached: (String) -> Unit = {},
 ) {
@@ -60,6 +61,38 @@ class StreamProxyServer(
         return null
     }
 
+    fun enforceCacheLimit() {
+        val maxMb = maxCacheSizeMbProvider()
+        if (maxMb <= 0) return // 0 or negative = unlimited
+        val maxBytes = maxMb.toLong() * 1024L * 1024L
+        val dir = cacheDirProvider()
+        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".cache") }?.toList().orEmpty()
+        var total = files.sumOf { it.length() }
+        if (total <= maxBytes) return
+        files.sortedBy { it.lastModified() }.forEach { f ->
+            if (total <= maxBytes) return@forEach
+            val len = f.length()
+            if (f.delete()) {
+                total -= len
+            }
+        }
+    }
+
+    fun clearSongCache(): Int {
+        val dir = cacheDirProvider()
+        var deleted = 0
+        dir.listFiles()?.forEach { f ->
+            if (f.isFile && f.delete()) deleted++
+        }
+        return deleted
+    }
+
+    private fun isOpenStartRange(rangeHeader: String?): Boolean {
+        if (rangeHeader.isNullOrBlank()) return true
+        val norm = rangeHeader.trim().lowercase()
+        return norm == "bytes=0-"
+    }
+
     private fun handleStream(exchange: HttpExchange) {
         try {
             val videoId = exchange.requestURI.path.removePrefix("/stream/").substringBefore("/")
@@ -82,8 +115,9 @@ class StreamProxyServer(
             }
 
             val rangeHeader = exchange.requestHeaders.getFirst("Range")
-            if (rangeHeader == null && (resolved.requireBoundedRange || resolved.useRangeChunks) && (resolved.contentLengthBytes ?: 0L) > 0L) {
-                streamChunkedUpstream(exchange, videoId, quality, resolved)
+            val openFromZero = isOpenStartRange(rangeHeader)
+            if (openFromZero && (resolved.requireBoundedRange || resolved.useRangeChunks) && (resolved.contentLengthBytes ?: 0L) > 0L) {
+                streamChunkedUpstream(exchange, videoId, quality, resolved, sendAs206 = rangeHeader != null)
                 return
             }
 
@@ -118,9 +152,10 @@ class StreamProxyServer(
                 val responseLength = if (contentLength > 0L) contentLength else 0L
                 exchange.sendResponseHeaders(status, responseLength)
 
-                val isFullDownload = status == 200 && cacheEnabledProvider() && rangeHeader == null
-                val cacheTemp = if (isFullDownload) File(cacheDirProvider(), "$videoId.${System.nanoTime()}.part") else null
-                val cacheFinal = if (isFullDownload) File(cacheDirProvider(), "$videoId.cache") else null
+                val isFullDownload = (status == 200 || (status == 206 && openFromZero)) && cacheEnabledProvider()
+                val cacheDir = cacheDirProvider().apply { mkdirs() }
+                val cacheTemp = if (isFullDownload) File(cacheDir, "$videoId.${System.nanoTime()}.part") else null
+                val cacheFinal = if (isFullDownload) File(cacheDir, "$videoId.cache") else null
                 val cacheOut = cacheTemp?.outputStream()?.buffered()
 
                 try {
@@ -135,8 +170,14 @@ class StreamProxyServer(
                     cacheOut?.flush()
                     cacheOut?.close()
                     if (cacheTemp != null && cacheFinal != null && cacheTemp.exists() && cacheTemp.length() > 0L) {
-                        if (replaceFile(cacheTemp, cacheFinal)) {
-                            runCatching { onSongCached(videoId) }
+                        val expectedLen = resolved.contentLengthBytes ?: contentLength
+                        if (expectedLen <= 0L || cacheTemp.length() >= expectedLen) {
+                            if (replaceFile(cacheTemp, cacheFinal)) {
+                                runCatching { onSongCached(videoId) }
+                                runCatching { enforceCacheLimit() }
+                            }
+                        } else {
+                            cacheTemp.delete()
                         }
                     }
                 } catch (_: Throwable) {
@@ -162,6 +203,7 @@ class StreamProxyServer(
         videoId: String,
         quality: DesktopAudioQuality,
         initial: ResolvedStream,
+        sendAs206: Boolean = false,
     ) {
         var resolved = initial
         var total = resolved.contentLengthBytes ?: return
@@ -175,7 +217,7 @@ class StreamProxyServer(
             return
         }
 
-        // Open chunk 0 before committing 200 headers so 403/410 can trigger stream refresh.
+        // Open chunk 0 before committing headers so 403/410 can trigger stream refresh.
         var firstEnd = minOf(chunkSize - 1, total - 1)
         var firstResp = openUpstream(resolved, "bytes=0-$firstEnd")
         if (firstResp.code == 403 || firstResp.code == 410) {
@@ -202,11 +244,17 @@ class StreamProxyServer(
 
         exchange.responseHeaders.set("Content-Type", resolved.mimeType)
         exchange.responseHeaders.set("Accept-Ranges", "bytes")
-        exchange.sendResponseHeaders(200, total)
+        if (sendAs206) {
+            exchange.responseHeaders.set("Content-Range", "bytes 0-${total - 1}/$total")
+            exchange.sendResponseHeaders(206, total)
+        } else {
+            exchange.sendResponseHeaders(200, total)
+        }
 
         val cacheEnabled = cacheEnabledProvider()
-        val cacheTemp = if (cacheEnabled) File(cacheDirProvider(), "${resolved.videoId}.${System.nanoTime()}.part") else null
-        val cacheFinal = if (cacheEnabled) File(cacheDirProvider(), "${resolved.videoId}.cache") else null
+        val cacheDir = cacheDirProvider().apply { mkdirs() }
+        val cacheTemp = if (cacheEnabled) File(cacheDir, "${resolved.videoId}.${System.nanoTime()}.part") else null
+        val cacheFinal = if (cacheEnabled) File(cacheDir, "${resolved.videoId}.cache") else null
         val cacheOut = cacheTemp?.outputStream()?.buffered()
 
         try {
@@ -241,6 +289,7 @@ class StreamProxyServer(
             if (cacheTemp != null && cacheFinal != null && cacheTemp.exists() && cacheTemp.length() == total) {
                 if (replaceFile(cacheTemp, cacheFinal)) {
                     runCatching { onSongCached(resolved.videoId) }
+                    runCatching { enforceCacheLimit() }
                 }
             }
         } catch (_: Throwable) {
@@ -274,12 +323,7 @@ class StreamProxyServer(
         val total = file.length()
         val range = exchange.requestHeaders.getFirst("Range")
         val isHead = exchange.requestMethod.equals("HEAD", ignoreCase = true)
-        val contentType = when (file.extension.lowercase()) {
-            "m4a", "mp4" -> "audio/mp4"
-            "mp3" -> "audio/mpeg"
-            "ogg", "opus" -> "audio/ogg"
-            else -> "audio/webm"
-        }
+        val contentType = detectMimeType(file)
         exchange.responseHeaders.set("Content-Type", contentType)
         exchange.responseHeaders.set("Accept-Ranges", "bytes")
 
@@ -334,5 +378,42 @@ class StreamProxyServer(
         runCatching { httpClient.dispatcher.cancelAll() }
         runCatching { httpClient.dispatcher.executorService.shutdownNow() }
         runCatching { httpClient.connectionPool.evictAll() }
+    }
+
+    companion object {
+        fun detectMimeType(file: File): String {
+            return when (file.extension.lowercase()) {
+                "m4a", "mp4" -> "audio/mp4"
+                "mp3" -> "audio/mpeg"
+                "ogg", "opus" -> "audio/ogg"
+                "flac" -> "audio/flac"
+                "webm" -> "audio/webm"
+                else -> sniffMagicMime(file)
+            }
+        }
+
+        private fun sniffMagicMime(file: File): String {
+            val header = ByteArray(12)
+            val n = runCatching { file.inputStream().use { it.read(header) } }.getOrDefault(0)
+            if (n >= 8 && header[4] == 'f'.code.toByte() && header[5] == 't'.code.toByte() &&
+                header[6] == 'y'.code.toByte() && header[7] == 'p'.code.toByte()
+            ) return "audio/mp4"
+            if (n >= 4 && header[0] == 'O'.code.toByte() && header[1] == 'g'.code.toByte() &&
+                header[2] == 'g'.code.toByte() && header[3] == 'S'.code.toByte()
+            ) return "audio/ogg"
+            if (n >= 4 && header[0] == 'f'.code.toByte() && header[1] == 'L'.code.toByte() &&
+                header[2] == 'a'.code.toByte() && header[3] == 'C'.code.toByte()
+            ) return "audio/flac"
+            if (n >= 3 && header[0] == 'I'.code.toByte() && header[1] == 'D'.code.toByte() && header[2] == '3'.code.toByte()) {
+                return "audio/mpeg"
+            }
+            if (n >= 2 && (header[0].toInt() and 0xFF) == 0xFF && (header[1].toInt() and 0xE0) == 0xE0) {
+                return "audio/mpeg"
+            }
+            return "audio/webm"
+        }
+
+        fun directorySizeBytes(dir: File): Long =
+            if (!dir.exists()) 0L else dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
     }
 }

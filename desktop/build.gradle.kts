@@ -66,6 +66,7 @@ compose.desktop {
                 "java.management",
                 "java.naming",
                 "java.sql",
+                "java.xml",
                 "jdk.accessibility",
                 "jdk.crypto.ec",
                 "jdk.httpserver",

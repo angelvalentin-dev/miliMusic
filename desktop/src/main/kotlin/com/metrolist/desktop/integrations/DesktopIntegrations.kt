@@ -18,13 +18,11 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -41,9 +39,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.LocalTime
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 object DesktopLastFmService {
     private val httpClient = OkHttpClient.Builder()
@@ -87,7 +87,7 @@ object DesktopLastFmService {
         }.build()
         val req = Request.Builder()
             .url("https://ws.audioscrobbler.com/2.0/")
-            .header("User-Agent", "Metrolist Desktop (https://github.com/MetrolistGroup/Metrolist)")
+            .header("User-Agent", "miliMusic Desktop (https://github.com/angelvalentin-dev/miliMusic)")
             .post(form)
             .build()
         httpClient.newCall(req).execute().use { resp ->
@@ -187,10 +187,16 @@ class DesktopDiscordRpc(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
+    // Persistent Windows IPC named pipe (Discord clears presence immediately if closed!)
+    private val ipcLock = Any()
+    private var ipcPipe: RandomAccessFile? = null
+
     private var gatewaySocket: WebSocket? = null
     private var heartbeatJob: Job? = null
     private var activeGatewayToken: String? = null
     private var gatewayReady: Boolean = false
+    private val lastGatewaySeq = AtomicReference<Long?>(null)
+    private var lastStatus: String = "online"
 
     fun renderTemplate(template: String, song: DesktopSong): String =
         template
@@ -204,6 +210,13 @@ class DesktopDiscordRpc(
             .trim()
             .ifBlank { song.title }
 
+    fun activityTypeCode(typeName: String): Int = when (typeName.uppercase()) {
+        "PLAYING" -> 0
+        "WATCHING" -> 3
+        "COMPETING" -> 5
+        else -> 2 // LISTENING
+    }
+
     fun updatePresence(
         song: DesktopSong?,
         isPlaying: Boolean,
@@ -211,26 +224,47 @@ class DesktopDiscordRpc(
         durationMs: Long,
         settings: DesktopSettings,
     ) {
+        lastStatus = settings.discordUserStatus.ifBlank { "online" }
         if (!settings.enableDiscordRpc || song == null || !isPlaying) {
             clearPresence()
             return
         }
         val details = renderTemplate(settings.discordDetailsTemplate.ifBlank { "{song.name}" }, song)
         val state = renderTemplate(settings.discordStateTemplate.ifBlank { "{artist.name}" }, song)
+        val actName = renderTemplate(settings.discordActivityName.ifBlank { "miliMusic" }, song)
+        val actType = activityTypeCode(settings.discordActivityType)
         val now = System.currentTimeMillis()
         val startMs = (now - positionMs.coerceAtLeast(0L))
         val endMs = if (durationMs > 0L) startMs + durationMs else null
-        val watchUrl = "https://music.youtube.com/watch?v=${song.id}"
+
+        val buttons = buildList {
+            if (settings.discordButton1Enabled && settings.discordButton1Text.isNotBlank() && settings.discordButton1Url.isNotBlank()) {
+                add(renderTemplate(settings.discordButton1Text, song).take(32) to renderTemplate(settings.discordButton1Url, song))
+            }
+            if (settings.discordButton2Enabled && settings.discordButton2Text.isNotBlank() && settings.discordButton2Url.isNotBlank()) {
+                add(renderTemplate(settings.discordButton2Text, song).take(32) to renderTemplate(settings.discordButton2Url, song))
+            }
+        }
 
         scope.launch {
             val ipcOk = if (AppPaths.isWindows) {
-                sendWindowsIpcActivity(song, details, state, startMs, endMs, watchUrl)
+                sendWindowsIpcActivity(song, actType, actName, details, state, startMs, endMs, buttons)
             } else false
 
             if (ipcOk) {
                 _connected.value = true
             } else if (settings.discordToken.isNotBlank()) {
-                sendGatewayActivity(settings.discordToken.trim(), song, details, state, startMs, endMs, watchUrl)
+                sendGatewayActivity(
+                    token = settings.discordToken.trim(),
+                    song = song,
+                    actType = actType,
+                    actName = actName,
+                    details = details,
+                    state = state,
+                    startMs = startMs,
+                    endMs = endMs,
+                    status = lastStatus,
+                )
             } else {
                 _connected.value = false
             }
@@ -250,7 +284,7 @@ class DesktopDiscordRpc(
                         buildJsonObject {
                             put("since", 0)
                             put("activities", buildJsonArray {})
-                            put("status", "online")
+                            put("status", lastStatus)
                             put("afk", false)
                         },
                     )
@@ -260,16 +294,59 @@ class DesktopDiscordRpc(
         }
     }
 
+    private fun ensureWindowsIpcPipe(): RandomAccessFile? {
+        ipcPipe?.let { return it }
+        for (idx in 0..9) {
+            val pipePath = "\\\\.\\pipe\\discord-ipc-$idx"
+            val opened = runCatching {
+                val pipe = RandomAccessFile(pipePath, "rw")
+                val handshake = """{"v":1,"client_id":"$DISCORD_APP_ID"}"""
+                writeIpcFrame(pipe, 0, handshake)
+                readIpcFrame(pipe)
+                pipe
+            }.getOrNull()
+            if (opened != null) {
+                ipcPipe = opened
+                return opened
+            }
+        }
+        return null
+    }
+
+    private fun closeIpcPipeLocked() {
+        runCatching { ipcPipe?.close() }
+        ipcPipe = null
+    }
+
+    private fun sendWindowsIpcCommand(cmdJson: String): Boolean = synchronized(ipcLock) {
+        repeat(2) {
+            val pipe = ensureWindowsIpcPipe() ?: return false
+            val ok = runCatching {
+                writeIpcFrame(pipe, 1, cmdJson)
+                readIpcFrame(pipe)
+                true
+            }.getOrElse {
+                closeIpcPipeLocked()
+                false
+            }
+            if (ok) return true
+        }
+        false
+    }
+
     private fun sendWindowsIpcActivity(
         song: DesktopSong,
+        actType: Int,
+        actName: String,
         details: String,
         state: String,
         startMs: Long,
         endMs: Long?,
-        watchUrl: String,
+        buttons: List<Pair<String, String>>,
     ): Boolean {
         val activity = buildJsonObject {
-            put("type", 2)
+            put("type", actType)
+            put("name", actName.take(128))
             put("details", details.take(128))
             put("state", state.take(128))
             put(
@@ -288,17 +365,21 @@ class DesktopDiscordRpc(
                     put("large_text", (song.albumName ?: song.title).take(128))
                 },
             )
-            put(
-                "buttons",
-                buildJsonArray {
-                    add(
-                        buildJsonObject {
-                            put("label", "Listen on YouTube Music")
-                            put("url", watchUrl)
-                        },
-                    )
-                },
-            )
+            if (buttons.isNotEmpty()) {
+                put(
+                    "buttons",
+                    buildJsonArray {
+                        buttons.forEach { (label, url) ->
+                            add(
+                                buildJsonObject {
+                                    put("label", label)
+                                    put("url", url)
+                                },
+                            )
+                        }
+                    },
+                )
+            }
         }
         val cmd = buildJsonObject {
             put("cmd", "SET_ACTIVITY")
@@ -311,10 +392,13 @@ class DesktopDiscordRpc(
             )
             put("nonce", UUID.randomUUID().toString())
         }.toString()
-        return writeDiscordIpcCommand(cmd)
+        return sendWindowsIpcCommand(cmd)
     }
 
     private fun sendWindowsIpcClear(): Boolean {
+        synchronized(ipcLock) {
+            if (ipcPipe == null) return false
+        }
         val cmd = buildJsonObject {
             put("cmd", "SET_ACTIVITY")
             put(
@@ -326,25 +410,7 @@ class DesktopDiscordRpc(
             )
             put("nonce", UUID.randomUUID().toString())
         }.toString()
-        return writeDiscordIpcCommand(cmd)
-    }
-
-    private fun writeDiscordIpcCommand(cmdJson: String): Boolean {
-        for (idx in 0..9) {
-            val pipePath = "\\\\.\\pipe\\discord-ipc-$idx"
-            val ok = runCatching {
-                RandomAccessFile(pipePath, "rw").use { pipe ->
-                    val handshake = """{"v":1,"client_id":"$DISCORD_APP_ID"}"""
-                    writeIpcFrame(pipe, 0, handshake)
-                    readIpcFrame(pipe)
-                    writeIpcFrame(pipe, 1, cmdJson)
-                    readIpcFrame(pipe)
-                    true
-                }
-            }.getOrDefault(false)
-            if (ok) return true
-        }
-        return false
+        return sendWindowsIpcCommand(cmd)
     }
 
     private fun writeIpcFrame(pipe: RandomAccessFile, op: Int, jsonPayload: String) {
@@ -360,40 +426,39 @@ class DesktopDiscordRpc(
     private fun readIpcFrame(pipe: RandomAccessFile): String {
         val header = ByteArray(8)
         pipe.readFully(header)
-        val buf = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
-        buf.int // op
-        val len = buf.int.coerceIn(0, 65536)
+        val len = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN).getInt(4).coerceIn(0, 65536)
         val body = ByteArray(len)
         pipe.readFully(body)
         return String(body, Charsets.UTF_8)
     }
 
     private fun sendGatewayActivity(
-        rawToken: String,
+        token: String,
         song: DesktopSong,
+        actType: Int,
+        actName: String,
         details: String,
         state: String,
         startMs: Long,
         endMs: Long?,
-        watchUrl: String,
+        status: String,
     ) {
-        ensureGatewayConnected(rawToken)
+        ensureGatewayConnected(token)
         if (!gatewayReady) return
-        val presenceJson = buildJsonObject {
+        val payload = buildJsonObject {
             put("op", 3)
             put(
                 "d",
                 buildJsonObject {
                     put("since", 0)
-                    put("status", "online")
-                    put("afk", false)
                     put(
                         "activities",
                         buildJsonArray {
                             add(
                                 buildJsonObject {
-                                    put("name", song.artistDisplay.take(128))
-                                    put("type", 2)
+                                    put("name", actName.take(128))
+                                    put("type", actType)
+                                    put("application_id", DISCORD_APP_ID)
                                     put("details", details.take(128))
                                     put("state", state.take(128))
                                     put(
@@ -403,79 +468,70 @@ class DesktopDiscordRpc(
                                             if (endMs != null) put("end", endMs)
                                         },
                                     )
-                                    put(
-                                        "buttons",
-                                        buildJsonArray {
-                                            add(JsonPrimitive("Listen on YouTube Music"))
-                                        },
-                                    )
-                                    put(
-                                        "metadata",
-                                        buildJsonObject {
-                                            put(
-                                                "button_urls",
-                                                buildJsonArray {
-                                                    add(JsonPrimitive(watchUrl))
-                                                },
-                                            )
-                                        },
-                                    )
                                 },
                             )
                         },
                     )
+                    put("status", status)
+                    put("afk", false)
                 },
             )
         }.toString()
-        runCatching { gatewaySocket?.send(presenceJson) }
+        runCatching { gatewaySocket?.send(payload) }
     }
 
     private fun ensureGatewayConnected(token: String) {
-        if (gatewaySocket != null && activeGatewayToken == token && gatewayReady) return
-        closeGateway()
+        if (gatewaySocket != null && activeGatewayToken == token) return
+        disconnectGateway()
         activeGatewayToken = token
         val req = Request.Builder().url(GATEWAY_URL).build()
+        val json = Json { ignoreUnknownKeys = true; isLenient = true }
         gatewaySocket = httpClient.newWebSocket(
             req,
             object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) {
-                    runCatching {
-                        val root = Json.parseToJsonElement(text).jsonObject
-                        val op = root["op"]?.jsonPrimitive?.intOrNull ?: -1
-                        if (op == 10) {
-                            val interval = root["d"]?.jsonObject?.get("heartbeat_interval")?.jsonPrimitive?.longOrNull ?: 41250L
-                            startGatewayHeartbeat(webSocket, interval)
+                    val obj = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return
+                    obj["s"]?.jsonPrimitive?.longOrNull?.let { lastGatewaySeq.set(it) }
+                    val op = obj["op"]?.jsonPrimitive?.intOrNull ?: return
+                    when (op) {
+                        10 -> {
+                            val interval = obj["d"]?.jsonObject?.get("heartbeat_interval")?.jsonPrimitive?.longOrNull ?: 41_250L
+                            startHeartbeat(webSocket, interval)
                             val identify = buildJsonObject {
                                 put("op", 2)
                                 put(
                                     "d",
                                     buildJsonObject {
                                         put("token", token)
-                                        put("intents", 0)
+                                        put("capabilities", 0)
                                         put(
                                             "properties",
                                             buildJsonObject {
-                                                put("os", "windows")
-                                                put("browser", "Discord Client")
-                                                put("device", DISCORD_APP_ID)
+                                                put("os", "Windows")
+                                                put("browser", "miliMusic Desktop")
+                                                put("device", "miliMusic Desktop")
                                             },
                                         )
                                     },
                                 )
                             }.toString()
                             webSocket.send(identify)
-                            gatewayReady = true
-                            _connected.value = true
+                        }
+                        0 -> {
+                            if (obj["t"]?.jsonPrimitive?.contentOrNull == "READY") {
+                                gatewayReady = true
+                                _connected.value = true
+                            }
                         }
                     }
                 }
 
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     gatewayReady = false
                     _connected.value = false
                 }
 
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     gatewayReady = false
                     _connected.value = false
                 }
@@ -483,27 +539,39 @@ class DesktopDiscordRpc(
         )
     }
 
-    private fun startGatewayHeartbeat(ws: WebSocket, intervalMs: Long) {
+    private fun startHeartbeat(ws: WebSocket, intervalMs: Long) {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             while (isActive) {
                 delay(intervalMs)
-                runCatching { ws.send("""{"op":1,"d":null}""") }
+                val seq = lastGatewaySeq.get()
+                val msg = if (seq != null) """{"op":1,"d":$seq}""" else """{"op":1,"d":null}"""
+                runCatching { ws.send(msg) }
             }
         }
     }
 
-    private fun closeGateway() {
+    private fun disconnectGateway() {
         heartbeatJob?.cancel()
         heartbeatJob = null
         gatewayReady = false
+        lastGatewaySeq.set(null)
         runCatching { gatewaySocket?.close(1000, null) }
         gatewaySocket = null
+        activeGatewayToken = null
         _connected.value = false
     }
 
     fun shutdown() {
-        closeGateway()
+        synchronized(ipcLock) {
+            runCatching {
+                if (ipcPipe != null) {
+                    sendWindowsIpcClear()
+                }
+            }
+            closeIpcPipeLocked()
+        }
+        disconnectGateway()
         runCatching { httpClient.dispatcher.cancelAll() }
         runCatching { httpClient.dispatcher.executorService.shutdownNow() }
         runCatching { httpClient.connectionPool.evictAll() }
@@ -516,42 +584,18 @@ class DesktopAlarmScheduler(
     private val onStatusMessage: (String) -> Unit,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
-    companion object {
-        private val json = Json { ignoreUnknownKeys = true }
-
-        fun parseAlarms(rawJson: String): List<DesktopAlarmEntry> {
-            if (rawJson.isBlank()) return emptyList()
-            return runCatching {
-                val arr = json.parseToJsonElement(rawJson)
-                if (arr !is JsonArray) return emptyList()
-                arr.mapNotNull { elem ->
-                    val obj = elem as? JsonObject ?: return@mapNotNull null
-                    DesktopAlarmEntry(
-                        id = obj["id"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString(),
-                        enabled = obj["enabled"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: true,
-                        hour = (obj["hour"]?.jsonPrimitive?.intOrNull ?: 7).coerceIn(0, 23),
-                        minute = (obj["minute"]?.jsonPrimitive?.intOrNull ?: 0).coerceIn(0, 59),
-                        playlistId = obj["playlistId"]?.jsonPrimitive?.content ?: "TOP",
-                        randomSong = obj["randomSong"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: false,
-                        nextTriggerAt = obj["nextTriggerAt"]?.jsonPrimitive?.longOrNull ?: -1L,
-                    )
-                }
-            }.getOrDefault(emptyList())
-        }
-
-        fun serializeAlarms(entries: List<DesktopAlarmEntry>): String =
-            json.encodeToString(entries)
-    }
-
     private val _alarms = MutableStateFlow<List<DesktopAlarmEntry>>(emptyList())
     val alarms: StateFlow<List<DesktopAlarmEntry>> = _alarms.asStateFlow()
 
-    private val triggeredToday = mutableSetOf<String>()
-    private var lastTriggerDate: LocalDate = LocalDate.now()
-    private var schedulerJob: Job? = null
+    private val _ringingAlarm = MutableStateFlow<DesktopAlarmEntry?>(null)
+    val ringingAlarm: StateFlow<DesktopAlarmEntry?> = _ringingAlarm.asStateFlow()
+
+    private var tickerJob: Job? = null
+    private var snoozeJob: Job? = null
+    private val firedKeys = mutableSetOf<String>()
 
     init {
-        startWatcher()
+        startTicker()
     }
 
     fun parseAlarms(rawJson: String): List<DesktopAlarmEntry> = Companion.parseAlarms(rawJson)
@@ -562,25 +606,36 @@ class DesktopAlarmScheduler(
         _alarms.value = parseAlarms(rawJson)
     }
 
-    private fun startWatcher() {
-        schedulerJob = scope.launch {
+    companion object {
+        private val alarmJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
+        fun parseAlarms(rawJson: String): List<DesktopAlarmEntry> {
+            if (rawJson.isBlank()) return emptyList()
+            return runCatching {
+                alarmJson.decodeFromString<List<DesktopAlarmEntry>>(rawJson)
+            }.getOrDefault(emptyList())
+        }
+
+        fun serializeAlarms(entries: List<DesktopAlarmEntry>): String =
+            alarmJson.encodeToString(entries)
+    }
+
+    private fun startTicker() {
+        tickerJob?.cancel()
+        tickerJob = scope.launch {
             while (isActive) {
-                val today = LocalDate.now()
-                if (today != lastTriggerDate) {
-                    lastTriggerDate = today
-                    triggeredToday.clear()
-                }
-                val now = LocalTime.now()
-                val currentAlarms = _alarms.value
-                for (alarm in currentAlarms) {
-                    val triggerKey = "${alarm.id}_${today}_${alarm.hour}_${alarm.minute}"
-                    if (alarm.enabled &&
-                        alarm.hour == now.hour &&
-                        alarm.minute == now.minute &&
-                        triggerKey !in triggeredToday
-                    ) {
-                        triggeredToday.add(triggerKey)
-                        triggerAlarm(alarm)
+                val nowDt = LocalDateTime.now()
+                val now = nowDt.toLocalTime()
+                val today = nowDt.toLocalDate()
+                val dayOfWeek = nowDt.dayOfWeek.value // 1=Mon..7=Sun
+                for (alarm in _alarms.value) {
+                    if (!alarm.enabled) continue
+                    if (alarm.daysOfWeek.isNotEmpty() && dayOfWeek !in alarm.daysOfWeek) continue
+                    if (alarm.hour == now.hour && alarm.minute == now.minute) {
+                        val key = "${alarm.id}_${today}_${alarm.hour}_${alarm.minute}"
+                        if (firedKeys.add(key)) {
+                            triggerAlarm(alarm)
+                        }
                     }
                 }
                 delay(15_000L)
@@ -590,26 +645,59 @@ class DesktopAlarmScheduler(
 
     fun triggerAlarm(alarm: DesktopAlarmEntry) {
         scope.launch {
-            val songs = when (alarm.playlistId) {
-                "LIKED", "" -> database.likedSongs()
-                "TOP" -> database.topSongs(50)
-                "DOWNLOADED" -> database.downloadedSongs()
-                "CACHED" -> database.cachedSongs()
-                else -> database.playlistSongs(alarm.playlistId)
-            }.ifEmpty {
-                database.likedSongs().ifEmpty { database.topSongs(50) }.ifEmpty { database.recentlyPlayed(30) }
+            val songs = resolveSongsForAlarm(alarm)
+            if (songs.isEmpty()) {
+                onStatusMessage("Alarma ${"%02d:%02d".format(alarm.hour, alarm.minute)}: sin canciones disponibles")
+                return@launch
             }
-            if (songs.isNotEmpty()) {
-                val playList = if (alarm.randomSong) songs.shuffled() else songs
-                audioPlayer.playQueue(playList, 0)
-                onStatusMessage("Alarma musical (%02d:%02d): Reproduciendo %s".format(alarm.hour, alarm.minute, playList.first().title))
-            } else {
-                onStatusMessage("Alarma musical (%02d:%02d): No hay canciones en la lista seleccionada".format(alarm.hour, alarm.minute))
+            val startIndex = if (alarm.randomSong) songs.indices.random() else 0
+            val targetVol = audioPlayer.state.value.volume.coerceAtLeast(0.4f)
+            if (alarm.volumeRamp) {
+                audioPlayer.setVolume(0.1f, persist = false)
+            }
+            audioPlayer.playQueue(songs, startIndex = startIndex, loadRadio = false)
+            _ringingAlarm.value = alarm
+            val labelSuffix = alarm.label.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
+            onStatusMessage("Alarma musical activada (${"%02d:%02d".format(alarm.hour, alarm.minute)}$labelSuffix)")
+            if (alarm.volumeRamp) {
+                for (step in 1..10) {
+                    delay(1_500L)
+                    if (_ringingAlarm.value?.id != alarm.id) break
+                    val vol = 0.1f + (targetVol - 0.1f) * (step / 10f)
+                    audioPlayer.setVolume(vol, persist = false)
+                }
             }
         }
     }
 
+    fun snoozeRingingAlarm(minutes: Int = 5) {
+        val current = _ringingAlarm.value ?: return
+        _ringingAlarm.value = null
+        audioPlayer.pause()
+        onStatusMessage("Alarma pospuesta $minutes min")
+        snoozeJob?.cancel()
+        snoozeJob = scope.launch {
+            delay(minutes * 60_000L)
+            triggerAlarm(current)
+        }
+    }
+
+    fun dismissRingingAlarm() {
+        snoozeJob?.cancel()
+        _ringingAlarm.value = null
+    }
+
+    private fun resolveSongsForAlarm(alarm: DesktopAlarmEntry): List<DesktopSong> = when (alarm.playlistId) {
+        "TOP", "" -> database.topSongs(50).ifEmpty { database.likedSongs() }.ifEmpty { database.librarySongs() }
+        "LIKED" -> database.likedSongs().ifEmpty { database.librarySongs() }
+        "DOWNLOADED" -> database.downloadedSongs().ifEmpty { database.librarySongs() }
+        else -> database.playlistSongs(alarm.playlistId).ifEmpty { database.topSongs(50) }
+    }
+
     fun stop() {
-        schedulerJob?.cancel()
+        tickerJob?.cancel()
+        snoozeJob?.cancel()
+        tickerJob = null
+        snoozeJob = null
     }
 }

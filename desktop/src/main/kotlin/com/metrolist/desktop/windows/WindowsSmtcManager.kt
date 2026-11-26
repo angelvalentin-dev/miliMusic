@@ -26,10 +26,13 @@ class WindowsSmtcManager(
     private val onStop: () -> Unit,
 ) {
     private var lib: SmtcNativeLibrary? = null
+    private var enabled: Boolean = true
+    private var lastTimelineUpdateMs: Long = 0L
 
     // Keep strong reference so GC never collects JNA callback while native DLL holds pointer
     private val callback = object : SmtcNativeLibrary.ActionCallback {
         override fun invoke(actionCode: Int) {
+            if (!enabled) return
             when (actionCode) {
                 ACTION_PLAY -> onPlay()
                 ACTION_PAUSE -> onPause()
@@ -41,20 +44,37 @@ class WindowsSmtcManager(
     }
 
     init {
-        if (AppPaths.isWindows) {
-            val dll = AppPaths.bundledFile("milimusic_smtc.dll")
-            if (dll != null && dll.exists()) {
-                runCatching {
-                    val loaded = Native.load(dll.absolutePath, SmtcNativeLibrary::class.java)
-                    if (loaded.smtc_init(WString("miliMusic"), callback) == 0) {
-                        lib = loaded
-                    }
+        initNativeIfWindows()
+    }
+
+    @Synchronized
+    private fun initNativeIfWindows() {
+        if (!AppPaths.isWindows || lib != null) return
+        val dll = AppPaths.bundledFile("milimusic_smtc.dll")
+        if (dll != null && dll.exists()) {
+            runCatching {
+                val loaded = Native.load(dll.absolutePath, SmtcNativeLibrary::class.java)
+                if (loaded.smtc_init(WString("miliMusic"), callback) == 0) {
+                    lib = loaded
                 }
             }
         }
     }
 
+    @Synchronized
+    fun setEnabled(enable: Boolean) {
+        if (enabled == enable) return
+        enabled = enable
+        if (!enable) {
+            runCatching { lib?.smtc_shutdown() }
+            lib = null
+        } else {
+            initNativeIfWindows()
+        }
+    }
+
     fun updateMetadata(title: String, artist: String, album: String?, thumbnailUrl: String?) {
+        if (!enabled) return
         runCatching {
             lib?.smtc_update_metadata(
                 WString(title),
@@ -66,6 +86,7 @@ class WindowsSmtcManager(
     }
 
     fun updatePlaybackStatus(isPlaying: Boolean, hasTrack: Boolean) {
+        if (!enabled) return
         val code = when {
             !hasTrack -> STATUS_STOPPED
             isPlaying -> STATUS_PLAYING
@@ -74,11 +95,17 @@ class WindowsSmtcManager(
         runCatching { lib?.smtc_update_status(code) }
     }
 
-    fun updateTimeline(positionMs: Long, durationMs: Long) {
+    fun updateTimeline(positionMs: Long, durationMs: Long, force: Boolean = false) {
+        if (!enabled) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastTimelineUpdateMs < 1_000L) return
+        lastTimelineUpdateMs = now
         runCatching { lib?.smtc_update_timeline(positionMs, durationMs) }
     }
 
+    @Synchronized
     fun shutdown() {
+        enabled = false
         runCatching { lib?.smtc_shutdown() }
         lib = null
     }

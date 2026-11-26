@@ -611,14 +611,20 @@ class DesktopDatabase(
             albumId = rs.getString("albumId"),
             albumName = rs.getString("albumName"),
             explicit = rs.getInt("explicit") != 0,
+            year = rs.getObject("year")?.let { (it as Number).toInt() },
             liked = rs.getInt("liked") != 0,
             likedDate = rs.getObject("likedDate")?.let { (it as Number).toLong() },
             inLibrary = rs.getObject("inLibrary")?.let { (it as Number).toLong() },
             dateDownload = rs.getObject("dateDownload")?.let { (it as Number).toLong() },
             isDownloaded = rs.getInt("isDownloaded") != 0,
+            isUploaded = runCatching { rs.getInt("isUploaded") != 0 }.getOrDefault(false),
             isVideo = rs.getInt("isVideo") != 0,
             isEpisode = rs.getInt("isEpisode") != 0,
             totalPlayTime = rs.getLong("totalPlayTime"),
+            lyricsOffset = runCatching { rs.getInt("lyricsOffset") }.getOrDefault(0),
+            romanizeLyrics = runCatching { rs.getInt("romanizeLyrics") != 0 }.getOrDefault(true),
+            playbackPosition = runCatching { rs.getObject("playbackPosition")?.let { (it as Number).toLong() } }.getOrNull(),
+            uploadEntityId = runCatching { rs.getString("uploadEntityId") }.getOrNull(),
             libraryAddToken = rs.getString("libraryAddToken"),
             libraryRemoveToken = rs.getString("libraryRemoveToken"),
             artists = artists,
@@ -1025,7 +1031,12 @@ class DesktopDatabase(
                 conn.prepareStatement(
                     """
                     INSERT INTO lyrics (id, lyrics, provider) VALUES (?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET lyrics = excluded.lyrics, provider = excluded.provider
+                    ON CONFLICT(id) DO UPDATE SET
+                        lyrics = excluded.lyrics,
+                        provider = excluded.provider,
+                        translatedLyrics = '',
+                        translationLanguage = '',
+                        translationMode = ''
                     """.trimIndent(),
                 ).use { ps ->
                     ps.setString(1, songId)
@@ -1035,6 +1046,859 @@ class DesktopDatabase(
                 }
             }
         }
+    }
+
+    fun getLyricsRecord(songId: String): DesktopLyricsRecord? = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT lyrics, provider, translatedLyrics, translationLanguage, translationMode FROM lyrics WHERE id = ? LIMIT 1",
+            ).use { ps ->
+                ps.setString(1, songId)
+                ps.executeQuery().use { rs ->
+                    if (rs.next()) {
+                        DesktopLyricsRecord(
+                            lyrics = rs.getString("lyrics"),
+                            provider = rs.getString("provider"),
+                            translatedLyrics = rs.getString("translatedLyrics").orEmpty(),
+                            translationLanguage = rs.getString("translationLanguage").orEmpty(),
+                            translationMode = rs.getString("translationMode").orEmpty(),
+                        )
+                    } else null
+                }
+            }
+        }
+    }
+
+    fun saveLyricsTranslation(songId: String, translatedLyrics: String, language: String, mode: String) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement(
+                    "UPDATE lyrics SET translatedLyrics = ?, translationLanguage = ?, translationMode = ? WHERE id = ?",
+                ).use { ps ->
+                    ps.setString(1, translatedLyrics)
+                    ps.setString(2, language)
+                    ps.setString(3, mode)
+                    ps.setString(4, songId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+    }
+
+    fun deleteLyrics(songId: String) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("DELETE FROM lyrics WHERE id = ?").use { ps ->
+                    ps.setString(1, songId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+    }
+
+    fun setSongLyricsOffset(songId: String, offsetMs: Int) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("UPDATE song SET lyricsOffset = ? WHERE id = ?").use { ps ->
+                    ps.setInt(1, offsetMs.coerceIn(-10_000, 10_000))
+                    ps.setString(2, songId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun setSongRomanizeLyrics(songId: String, romanize: Boolean) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("UPDATE song SET romanizeLyrics = ? WHERE id = ?").use { ps ->
+                    ps.setInt(1, if (romanize) 1 else 0)
+                    ps.setString(2, songId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun setEpisodePlaybackPosition(songId: String, positionMs: Long?) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("UPDATE song SET playbackPosition = ? WHERE id = ?").use { ps ->
+                    if (positionMs != null) ps.setLong(1, positionMs) else ps.setNull(1, java.sql.Types.INTEGER)
+                    ps.setString(2, songId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+    }
+
+    fun updateSongMetadata(songId: String, newTitle: String, newArtistName: String?) {
+        val cleanTitle = newTitle.trim()
+        if (cleanTitle.isEmpty()) return
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("UPDATE song SET title = ?, dateModified = ? WHERE id = ?").use { ps ->
+                    ps.setString(1, cleanTitle)
+                    ps.setLong(2, System.currentTimeMillis())
+                    ps.setString(3, songId)
+                    ps.executeUpdate()
+                }
+                if (!newArtistName.isNullOrBlank()) {
+                    conn.prepareStatement(
+                        "SELECT a.id, a.channelId, a.name FROM artist a JOIN song_artist_map m ON m.artistId = a.id WHERE m.songId = ? ORDER BY m.position ASC LIMIT 1",
+                    ).use { ps ->
+                        ps.setString(1, songId)
+                        ps.executeQuery().use { rs ->
+                            if (rs.next()) {
+                                val aId = rs.getString("id")
+                                val chId = rs.getString("channelId")
+                                val origName = rs.getString("name")
+                                ArtistAliasStore.setAlias(aId, chId, origName, newArtistName.trim())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun uploadedSongs(): List<DesktopSong> = querySongs("WHERE isUploaded = 1 ORDER BY COALESCE(dateModified, 0) DESC, title ASC")
+
+    fun episodeSongs(): List<DesktopSong> = querySongs("WHERE isEpisode = 1 ORDER BY COALESCE(dateModified, 0) DESC")
+
+    fun markSongUploaded(song: DesktopSong, uploadEntityId: String? = null) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.autoCommit = false
+                try {
+                    upsertSongInternal(conn, song.copy(isUploaded = true, uploadEntityId = uploadEntityId))
+                    conn.prepareStatement("UPDATE song SET isUploaded = 1, uploadEntityId = COALESCE(?, uploadEntityId) WHERE id = ?").use { ps ->
+                        ps.setString(1, uploadEntityId)
+                        ps.setString(2, song.id)
+                        ps.executeUpdate()
+                    }
+                    conn.commit()
+                } catch (t: Throwable) {
+                    conn.rollback()
+                    throw t
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun deleteSong(songId: String) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("DELETE FROM song WHERE id = ?").use { ps ->
+                    ps.setString(1, songId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun forgottenFavorites(limit: Int = 20): List<DesktopSong> = synchronized(dbLock) {
+        val cutoff = System.currentTimeMillis() - 14L * 24 * 60 * 60 * 1000
+        openConnection().use { conn ->
+            conn.prepareStatement(
+                """
+                SELECT s.* FROM song s
+                WHERE (s.liked = 1 OR s.totalPlayTime > 60000)
+                  AND COALESCE((SELECT MAX(e.timestamp) FROM event e WHERE e.songId = s.id), 0) < ?
+                ORDER BY s.totalPlayTime DESC, s.likedDate DESC
+                LIMIT ?
+                """.trimIndent(),
+            ).use { ps ->
+                ps.setLong(1, cutoff)
+                ps.setInt(2, limit)
+                ps.executeQuery().use { rs ->
+                    buildList { while (rs.next()) add(readSong(conn, rs)) }
+                }
+            }
+        }
+    }
+
+    fun artistLocalSongs(artistId: String): List<DesktopSong> = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement(
+                """
+                SELECT DISTINCT s.* FROM song s
+                JOIN song_artist_map m ON m.songId = s.id
+                WHERE m.artistId = ? AND (s.inLibrary IS NOT NULL OR s.liked = 1 OR s.isDownloaded = 1)
+                ORDER BY s.totalPlayTime DESC, s.title ASC
+                """.trimIndent(),
+            ).use { ps ->
+                ps.setString(1, artistId)
+                ps.executeQuery().use { rs ->
+                    buildList { while (rs.next()) add(readSong(conn, rs)) }
+                }
+            }
+        }
+    }
+
+    // Detailed play history & clear/delete
+    fun historyEntries(limit: Int = 150): List<DesktopHistoryEntry> = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement(
+                """
+                SELECT e.id AS eventId, e.timestamp AS ts, e.playTime AS pt, s.*
+                FROM event e
+                JOIN song s ON s.id = e.songId
+                ORDER BY e.timestamp DESC
+                LIMIT ?
+                """.trimIndent(),
+            ).use { ps ->
+                ps.setInt(1, limit)
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopHistoryEntry(
+                                    eventId = rs.getLong("eventId"),
+                                    timestampMs = rs.getLong("ts"),
+                                    playTimeMs = rs.getLong("pt"),
+                                    song = readSong(conn, rs),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun deleteHistoryEvent(eventId: Long) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("DELETE FROM event WHERE id = ?").use { ps ->
+                    ps.setLong(1, eventId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun clearListenHistory() {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.createStatement().use { st ->
+                    st.execute("DELETE FROM event")
+                    st.execute("DELETE FROM playCount")
+                    st.execute("UPDATE song SET totalPlayTime = 0")
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    // Time transfer (merge stats from one song to another)
+    fun transferSongStats(fromSongId: String, toSongId: String): Boolean {
+        if (fromSongId == toSongId) return false
+        var transferred = false
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.autoCommit = false
+                try {
+                    val fromPlayTime = conn.prepareStatement("SELECT totalPlayTime FROM song WHERE id = ?").use { ps ->
+                        ps.setString(1, fromSongId)
+                        ps.executeQuery().use { rs -> if (rs.next()) rs.getLong(1) else 0L }
+                    }
+                    conn.prepareStatement("UPDATE event SET songId = ? WHERE songId = ?").use { ps ->
+                        ps.setString(1, toSongId)
+                        ps.setString(2, fromSongId)
+                        ps.executeUpdate()
+                    }
+                    conn.prepareStatement(
+                        """
+                        INSERT INTO playCount (song, year, month, count)
+                        SELECT ?, year, month, count FROM playCount WHERE song = ?
+                        ON CONFLICT(song, year, month) DO UPDATE SET count = playCount.count + excluded.count
+                        """.trimIndent(),
+                    ).use { ps ->
+                        ps.setString(1, toSongId)
+                        ps.setString(2, fromSongId)
+                        ps.executeUpdate()
+                    }
+                    conn.prepareStatement("DELETE FROM playCount WHERE song = ?").use { ps ->
+                        ps.setString(1, fromSongId)
+                        ps.executeUpdate()
+                    }
+                    conn.prepareStatement("UPDATE song SET totalPlayTime = totalPlayTime + ? WHERE id = ?").use { ps ->
+                        ps.setLong(1, fromPlayTime)
+                        ps.setString(2, toSongId)
+                        ps.executeUpdate()
+                    }
+                    conn.prepareStatement("UPDATE song SET totalPlayTime = 0 WHERE id = ?").use { ps ->
+                        ps.setString(1, fromSongId)
+                        ps.executeUpdate()
+                    }
+                    conn.commit()
+                    transferred = true
+                } catch (t: Throwable) {
+                    conn.rollback()
+                    throw t
+                }
+            }
+        }
+        if (transferred) notifyChanged()
+        return transferred
+    }
+
+    // Playlist extended operations
+    fun addSongToPlaylistAt(playlistId: String, song: DesktopSong, atBeginning: Boolean = false, setVideoId: String? = null) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.autoCommit = false
+                try {
+                    upsertSongInternal(conn, song)
+                    val pos = if (atBeginning) {
+                        conn.prepareStatement("UPDATE playlist_song_map SET position = position + 1 WHERE playlistId = ?").use { ps ->
+                            ps.setString(1, playlistId)
+                            ps.executeUpdate()
+                        }
+                        0
+                    } else {
+                        conn.prepareStatement("SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_song_map WHERE playlistId = ?").use { ps ->
+                            ps.setString(1, playlistId)
+                            ps.executeQuery().use { rs -> if (rs.next()) rs.getInt(1) else 0 }
+                        }
+                    }
+                    conn.prepareStatement(
+                        "INSERT INTO playlist_song_map (playlistId, songId, position, setVideoId) VALUES (?, ?, ?, ?)",
+                    ).use { ps ->
+                        ps.setString(1, playlistId)
+                        ps.setString(2, song.id)
+                        ps.setInt(3, pos)
+                        ps.setString(4, setVideoId)
+                        ps.executeUpdate()
+                    }
+                    conn.prepareStatement(
+                        "UPDATE playlist SET thumbnailUrl = COALESCE(thumbnailUrl, ?), lastUpdateTime = ? WHERE id = ?",
+                    ).use { ps ->
+                        ps.setString(1, song.thumbnailUrl)
+                        ps.setLong(2, System.currentTimeMillis())
+                        ps.setString(3, playlistId)
+                        ps.executeUpdate()
+                    }
+                    conn.commit()
+                } catch (t: Throwable) {
+                    conn.rollback()
+                    throw t
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun reorderPlaylistSongs(playlistId: String, fromIndex: Int, toIndex: Int) {
+        if (fromIndex == toIndex) return
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.autoCommit = false
+                try {
+                    val mapIds = conn.prepareStatement(
+                        "SELECT id FROM playlist_song_map WHERE playlistId = ? ORDER BY position ASC",
+                    ).use { ps ->
+                        ps.setString(1, playlistId)
+                        ps.executeQuery().use { rs ->
+                            mutableListOf<Long>().apply { while (rs.next()) add(rs.getLong("id")) }
+                        }
+                    }
+                    if (fromIndex !in mapIds.indices || toIndex !in mapIds.indices) {
+                        conn.rollback()
+                        return
+                    }
+                    val moved = mapIds.removeAt(fromIndex)
+                    mapIds.add(toIndex, moved)
+                    conn.prepareStatement("UPDATE playlist_song_map SET position = ? WHERE id = ?").use { ps ->
+                        mapIds.forEachIndexed { idx, rowId ->
+                            ps.setInt(1, idx)
+                            ps.setLong(2, rowId)
+                            ps.addBatch()
+                        }
+                        ps.executeBatch()
+                    }
+                    conn.prepareStatement("UPDATE playlist SET lastUpdateTime = ? WHERE id = ?").use { ps ->
+                        ps.setLong(1, System.currentTimeMillis())
+                        ps.setString(2, playlistId)
+                        ps.executeUpdate()
+                    }
+                    conn.commit()
+                } catch (t: Throwable) {
+                    conn.rollback()
+                    throw t
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun updatePlaylistThumbnail(playlistId: String, thumbnailUrl: String?) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("UPDATE playlist SET thumbnailUrl = ?, lastUpdateTime = ? WHERE id = ?").use { ps ->
+                    ps.setString(1, thumbnailUrl)
+                    ps.setLong(2, System.currentTimeMillis())
+                    ps.setString(3, playlistId)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun getPlaylistSetVideoId(playlistId: String, songId: String): String? = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement(
+                "SELECT setVideoId FROM playlist_song_map WHERE playlistId = ? AND songId = ? LIMIT 1",
+            ).use { ps ->
+                ps.setString(1, playlistId)
+                ps.setString(2, songId)
+                ps.executeQuery().use { rs -> if (rs.next()) rs.getString("setVideoId") else null }
+            }
+        }
+    }
+
+    // Speed Dial
+    fun speedDialItems(): List<DesktopSpeedDialItem> = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement("SELECT * FROM speed_dial_item ORDER BY createDate DESC").use { ps ->
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopSpeedDialItem(
+                                    id = rs.getString("id"),
+                                    secondaryId = rs.getString("secondaryId"),
+                                    title = rs.getString("title"),
+                                    subtitle = rs.getString("subtitle"),
+                                    thumbnailUrl = rs.getString("thumbnailUrl"),
+                                    type = rs.getString("type"),
+                                    explicit = rs.getInt("explicit") != 0,
+                                    createDate = rs.getLong("createDate"),
+                                    albumId = rs.getString("albumId"),
+                                    albumName = rs.getString("albumName"),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun isPinnedToSpeedDial(id: String): Boolean = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement("SELECT 1 FROM speed_dial_item WHERE id = ? LIMIT 1").use { ps ->
+                ps.setString(1, id)
+                ps.executeQuery().use { it.next() }
+            }
+        }
+    }
+
+    fun toggleSpeedDial(item: DesktopSpeedDialItem): Boolean {
+        var pinned = false
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                val exists = conn.prepareStatement("SELECT 1 FROM speed_dial_item WHERE id = ? LIMIT 1").use { ps ->
+                    ps.setString(1, item.id)
+                    ps.executeQuery().use { it.next() }
+                }
+                if (exists) {
+                    conn.prepareStatement("DELETE FROM speed_dial_item WHERE id = ?").use { ps ->
+                        ps.setString(1, item.id)
+                        ps.executeUpdate()
+                    }
+                    pinned = false
+                } else {
+                    conn.prepareStatement(
+                        """
+                        INSERT OR REPLACE INTO speed_dial_item
+                        (id, secondaryId, title, subtitle, subtitleIds, thumbnailUrl, type, explicit, createDate, albumId, albumName)
+                        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                        """.trimIndent(),
+                    ).use { ps ->
+                        ps.setString(1, item.id)
+                        ps.setString(2, item.secondaryId)
+                        ps.setString(3, item.title)
+                        ps.setString(4, item.subtitle)
+                        ps.setString(5, item.thumbnailUrl)
+                        ps.setString(6, item.type)
+                        ps.setInt(7, if (item.explicit) 1 else 0)
+                        ps.setLong(8, System.currentTimeMillis())
+                        ps.setString(9, item.albumId)
+                        ps.setString(10, item.albumName)
+                        ps.executeUpdate()
+                    }
+                    pinned = true
+                }
+            }
+        }
+        notifyChanged()
+        return pinned
+    }
+
+    // Podcasts
+    fun bookmarkedPodcasts(): List<DesktopPodcast> = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement("SELECT * FROM podcast WHERE bookmarkedAt IS NOT NULL ORDER BY title ASC").use { ps ->
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopPodcast(
+                                    id = rs.getString("id"),
+                                    title = rs.getString("title"),
+                                    author = rs.getString("author"),
+                                    thumbnailUrl = rs.getString("thumbnailUrl"),
+                                    channelId = rs.getString("channelId"),
+                                    bookmarkedAt = rs.getObject("bookmarkedAt")?.let { (it as Number).toLong() },
+                                    libraryAddToken = rs.getString("libraryAddToken"),
+                                    libraryRemoveToken = rs.getString("libraryRemoveToken"),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun isPodcastBookmarked(podcastId: String): Boolean = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement("SELECT bookmarkedAt FROM podcast WHERE id = ?").use { ps ->
+                ps.setString(1, podcastId)
+                ps.executeQuery().use { rs -> rs.next() && rs.getObject("bookmarkedAt") != null }
+            }
+        }
+    }
+
+    fun togglePodcastBookmark(podcast: DesktopPodcast): Boolean {
+        val now = System.currentTimeMillis()
+        var bookmarked = false
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                val current = conn.prepareStatement("SELECT bookmarkedAt FROM podcast WHERE id = ?").use { ps ->
+                    ps.setString(1, podcast.id)
+                    ps.executeQuery().use { rs -> if (rs.next()) rs.getObject("bookmarkedAt") else null }
+                }
+                val newVal = if (current != null) null else now
+                bookmarked = newVal != null
+                conn.prepareStatement(
+                    """
+                    INSERT INTO podcast (id, title, author, thumbnailUrl, channelId, bookmarkedAt, lastUpdateTime, libraryAddToken, libraryRemoveToken)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title = excluded.title,
+                        author = COALESCE(excluded.author, podcast.author),
+                        thumbnailUrl = COALESCE(excluded.thumbnailUrl, podcast.thumbnailUrl),
+                        channelId = COALESCE(excluded.channelId, podcast.channelId),
+                        bookmarkedAt = excluded.bookmarkedAt,
+                        lastUpdateTime = excluded.lastUpdateTime
+                    """.trimIndent(),
+                ).use { ps ->
+                    ps.setString(1, podcast.id)
+                    ps.setString(2, podcast.title)
+                    ps.setString(3, podcast.author)
+                    ps.setString(4, podcast.thumbnailUrl)
+                    ps.setString(5, podcast.channelId)
+                    if (newVal != null) ps.setLong(6, newVal) else ps.setNull(6, java.sql.Types.INTEGER)
+                    ps.setLong(7, now)
+                    ps.setString(8, podcast.libraryAddToken)
+                    ps.setString(9, podcast.libraryRemoveToken)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+        return bookmarked
+    }
+
+    // Format metadata (for technical details & loudness normalization)
+    fun saveFormat(info: DesktopFormatInfo) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement(
+                    """
+                    INSERT INTO format (id, itag, mimeType, codecs, bitrate, sampleRate, contentLength, loudnessDb, perceptualLoudnessDb, playbackUrl)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        itag = excluded.itag,
+                        mimeType = excluded.mimeType,
+                        codecs = excluded.codecs,
+                        bitrate = excluded.bitrate,
+                        sampleRate = excluded.sampleRate,
+                        contentLength = excluded.contentLength,
+                        loudnessDb = COALESCE(excluded.loudnessDb, format.loudnessDb),
+                        perceptualLoudnessDb = COALESCE(excluded.perceptualLoudnessDb, format.perceptualLoudnessDb),
+                        playbackUrl = excluded.playbackUrl
+                    """.trimIndent(),
+                ).use { ps ->
+                    ps.setString(1, info.id)
+                    ps.setInt(2, info.itag)
+                    ps.setString(3, info.mimeType)
+                    ps.setString(4, info.codecs)
+                    ps.setInt(5, info.bitrate)
+                    if (info.sampleRate != null) ps.setInt(6, info.sampleRate) else ps.setNull(6, java.sql.Types.INTEGER)
+                    ps.setLong(7, info.contentLength)
+                    if (info.loudnessDb != null) ps.setDouble(8, info.loudnessDb) else ps.setNull(8, java.sql.Types.REAL)
+                    if (info.perceptualLoudnessDb != null) ps.setDouble(9, info.perceptualLoudnessDb) else ps.setNull(9, java.sql.Types.REAL)
+                    ps.setString(10, info.playbackUrl)
+                    ps.executeUpdate()
+                }
+            }
+        }
+    }
+
+    fun getFormat(songId: String): DesktopFormatInfo? = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement("SELECT * FROM format WHERE id = ? LIMIT 1").use { ps ->
+                ps.setString(1, songId)
+                ps.executeQuery().use { rs ->
+                    if (!rs.next()) return@synchronized null
+                    DesktopFormatInfo(
+                        id = rs.getString("id"),
+                        itag = rs.getInt("itag"),
+                        mimeType = rs.getString("mimeType"),
+                        codecs = rs.getString("codecs"),
+                        bitrate = rs.getInt("bitrate"),
+                        sampleRate = rs.getObject("sampleRate")?.let { (it as Number).toInt() },
+                        contentLength = rs.getLong("contentLength"),
+                        loudnessDb = rs.getObject("loudnessDb")?.let { (it as Number).toDouble() },
+                        perceptualLoudnessDb = rs.getObject("perceptualLoudnessDb")?.let { (it as Number).toDouble() },
+                        playbackUrl = rs.getString("playbackUrl"),
+                    )
+                }
+            }
+        }
+    }
+
+    // Recognition history (Shazam)
+    fun addRecognitionHistory(item: DesktopRecognitionHistoryItem) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement(
+                    """
+                    INSERT INTO recognition_history
+                    (trackId, title, artist, album, coverArtUrl, coverArtHqUrl, genre, releaseDate, label, shazamUrl, appleMusicUrl, spotifyUrl, isrc, youtubeVideoId, recognizedAt, liked)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """.trimIndent(),
+                ).use { ps ->
+                    ps.setString(1, item.trackId)
+                    ps.setString(2, item.title)
+                    ps.setString(3, item.artist)
+                    ps.setString(4, item.album)
+                    ps.setString(5, item.coverArtUrl)
+                    ps.setString(6, item.coverArtHqUrl)
+                    ps.setString(7, item.genre)
+                    ps.setString(8, item.releaseDate)
+                    ps.setString(9, item.label)
+                    ps.setString(10, item.shazamUrl)
+                    ps.setString(11, item.appleMusicUrl)
+                    ps.setString(12, item.spotifyUrl)
+                    ps.setString(13, item.isrc)
+                    ps.setString(14, item.youtubeVideoId)
+                    ps.setLong(15, item.recognizedAt)
+                    ps.setInt(16, if (item.liked) 1 else 0)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun recognitionHistory(limit: Int = 100): List<DesktopRecognitionHistoryItem> = synchronized(dbLock) {
+        openConnection().use { conn ->
+            conn.prepareStatement("SELECT * FROM recognition_history ORDER BY recognizedAt DESC LIMIT ?").use { ps ->
+                ps.setInt(1, limit)
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopRecognitionHistoryItem(
+                                    id = rs.getLong("id"),
+                                    trackId = rs.getString("trackId"),
+                                    title = rs.getString("title"),
+                                    artist = rs.getString("artist"),
+                                    album = rs.getString("album"),
+                                    coverArtUrl = rs.getString("coverArtUrl"),
+                                    coverArtHqUrl = rs.getString("coverArtHqUrl"),
+                                    genre = rs.getString("genre"),
+                                    releaseDate = rs.getString("releaseDate"),
+                                    label = rs.getString("label"),
+                                    shazamUrl = rs.getString("shazamUrl"),
+                                    appleMusicUrl = rs.getString("appleMusicUrl"),
+                                    spotifyUrl = rs.getString("spotifyUrl"),
+                                    isrc = rs.getString("isrc"),
+                                    youtubeVideoId = rs.getString("youtubeVideoId"),
+                                    recognizedAt = rs.getLong("recognizedAt"),
+                                    liked = rs.getInt("liked") != 0,
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun deleteRecognitionHistory(id: Long) {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.prepareStatement("DELETE FROM recognition_history WHERE id = ?").use { ps ->
+                    ps.setLong(1, id)
+                    ps.executeUpdate()
+                }
+            }
+        }
+        notifyChanged()
+    }
+
+    fun clearRecognitionHistory() {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.createStatement().use { it.execute("DELETE FROM recognition_history") }
+            }
+        }
+        notifyChanged()
+    }
+
+    // Local library search
+    data class LocalSearchResults(
+        val songs: List<DesktopSong> = emptyList(),
+        val albums: List<DesktopAlbum> = emptyList(),
+        val artists: List<DesktopArtist> = emptyList(),
+        val playlists: List<DesktopPlaylist> = emptyList(),
+    )
+
+    fun searchLocal(query: String, limit: Int = 50): LocalSearchResults = synchronized(dbLock) {
+        val pattern = "%${query.trim()}%"
+        if (query.isBlank()) return@synchronized LocalSearchResults()
+        openConnection().use { conn ->
+            val songs = conn.prepareStatement(
+                """
+                SELECT DISTINCT s.* FROM song s
+                LEFT JOIN song_artist_map m ON m.songId = s.id
+                LEFT JOIN artist a ON a.id = m.artistId
+                WHERE s.title LIKE ? OR s.albumName LIKE ? OR a.name LIKE ?
+                ORDER BY s.liked DESC, s.totalPlayTime DESC, s.title ASC
+                LIMIT ?
+                """.trimIndent(),
+            ).use { ps ->
+                ps.setString(1, pattern)
+                ps.setString(2, pattern)
+                ps.setString(3, pattern)
+                ps.setInt(4, limit)
+                ps.executeQuery().use { rs -> buildList { while (rs.next()) add(readSong(conn, rs)) } }
+            }
+            val albums = conn.prepareStatement(
+                "SELECT * FROM album WHERE title LIKE ? ORDER BY bookmarkedAt IS NULL, title ASC LIMIT ?",
+            ).use { ps ->
+                ps.setString(1, pattern)
+                ps.setInt(2, limit)
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopAlbum(
+                                    id = rs.getString("id"),
+                                    playlistId = rs.getString("playlistId"),
+                                    title = rs.getString("title"),
+                                    year = rs.getObject("year")?.let { (it as Number).toInt() },
+                                    thumbnailUrl = rs.getString("thumbnailUrl"),
+                                    songCount = rs.getInt("songCount"),
+                                    duration = rs.getInt("duration"),
+                                    explicit = rs.getInt("explicit") != 0,
+                                    bookmarkedAt = rs.getObject("bookmarkedAt")?.let { (it as Number).toLong() },
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+            val artists = conn.prepareStatement(
+                "SELECT * FROM artist WHERE name LIKE ? ORDER BY bookmarkedAt IS NULL, name ASC LIMIT ?",
+            ).use { ps ->
+                ps.setString(1, pattern)
+                ps.setInt(2, limit)
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopArtist(
+                                    id = rs.getString("id"),
+                                    name = rs.getString("name"),
+                                    thumbnailUrl = rs.getString("thumbnailUrl"),
+                                    channelId = rs.getString("channelId"),
+                                    bookmarkedAt = rs.getObject("bookmarkedAt")?.let { (it as Number).toLong() },
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+            val playlists = conn.prepareStatement(
+                """
+                SELECT p.*, (SELECT COUNT(*) FROM playlist_song_map m WHERE m.playlistId = p.id) AS songCount
+                FROM playlist p WHERE p.name LIKE ? ORDER BY p.name ASC LIMIT ?
+                """.trimIndent(),
+            ).use { ps ->
+                ps.setString(1, pattern)
+                ps.setInt(2, limit)
+                ps.executeQuery().use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                DesktopPlaylist(
+                                    id = rs.getString("id"),
+                                    name = rs.getString("name"),
+                                    browseId = rs.getString("browseId"),
+                                    thumbnailUrl = rs.getString("thumbnailUrl"),
+                                    isEditable = rs.getInt("isEditable") != 0,
+                                    isLocal = rs.getInt("isLocal") != 0,
+                                    remoteSongCount = rs.getObject("remoteSongCount")?.let { (it as Number).toInt() },
+                                    songCount = rs.getInt("songCount"),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+            LocalSearchResults(songs, albums, artists, playlists)
+        }
+    }
+
+    // Safe backup swap under dbLock
+    fun replaceDatabaseFile(newDbBytes: ByteArray) {
+        synchronized(dbLock) {
+            dbFile.parentFile?.mkdirs()
+            File("${dbFile.absolutePath}-wal").delete()
+            File("${dbFile.absolutePath}-shm").delete()
+            dbFile.writeBytes(newDbBytes)
+        }
+        ensureSchema()
+        notifyChanged()
+    }
+
+    fun clearLibraryData() {
+        synchronized(dbLock) {
+            openConnection().use { conn ->
+                conn.createStatement().use { st ->
+                    st.execute("UPDATE song SET liked = 0, likedDate = NULL, inLibrary = NULL")
+                    st.execute("UPDATE artist SET bookmarkedAt = NULL")
+                    st.execute("UPDATE album SET bookmarkedAt = NULL")
+                    st.execute("DELETE FROM playlist WHERE isLocal = 0")
+                    st.execute("DELETE FROM podcast")
+                }
+            }
+        }
+        notifyChanged()
     }
 
     private data class ExistingSongFlags(
