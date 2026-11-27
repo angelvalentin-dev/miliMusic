@@ -22,7 +22,6 @@ dependencyResolutionManagement {
             filter {
                 if (useMavenLocalInnerTubeX) {
                     includeModule("com.github.MetrolistGroup", "innertubex")
-                    includeModule("com.github.MetrolistGroup", "innertubex-android")
                     includeModule("com.github.MetrolistGroup", "innertubex-desktop")
                     includeGroup("com.github.MetrolistGroup.quackjs")
                 } else {
@@ -37,8 +36,6 @@ dependencyResolutionManagement {
     }
 }
 
-// F-Droid doesn't support foojay-resolver plugin
-rootProject.name = "Metrolist"
-include(":app")
+rootProject.name = "miliMusic"
 include(":innertube")
 include(":desktop")

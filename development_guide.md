@@ -1,41 +1,50 @@
-# Metrolist Dev Guide
+# Guía de desarrollo — miliMusic (Windows)
 
-This file outlines the process of setting up a local dev environment for Metrolist.
+Esta guía describe cómo configurar un entorno local para compilar, probar y empaquetar **miliMusic** en Windows x64.
 
-## Prerequisites
+## Requisitos previos
 
-- JDK 21
-- Android platform tools (if you don't have a keystore already)
+- **JDK 21** (por ejemplo, Eclipse Temurin 21).
+- **Visual Studio Build Tools / MSVC x64** (para compilar el helper de inicio de sesión WebView2 y la DLL del puente SMTC).
+- **WiX Toolset 3.x** (necesario únicamente para generar paquetes `.msi` y `.exe`).
+- **7-Zip** (`7z`) si deseas extraer libVLC automáticamente siguiendo el mismo flujo del CI.
 
-## Basic setup
+## Estructura de módulos
 
-This has been tested on Linux, but should work on other platforms with some adjustments.
+- `:innertube`: Biblioteca Kotlin JVM para comunicación con YouTube Music.
+- `:desktop`: Aplicación Windows con Compose Multiplatform, SQLite, libVLC y helpers nativos en `desktop/native/`.
 
-```bash
-git clone https://github.com/MetrolistGroup/Metrolist
-cd Metrolist
-git submodule update --init --recursive
-cd ..
-[ ! -f "app/persistent-debug.keystore" ] && keytool -genkeypair -v -keystore app/persistent-debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" || echo "Keystore already exists."
-./gradlew :app:assembleFossDebug
-ls app/build/outputs/apk/foss/debug/app-foss-debug.apk
+## Compilación de helpers nativos (opcional en desarrollo, requerida para empaquetado completo)
+
+Los binarios nativos se colocan en `desktop/resources/windows/` (carpeta ignorada por Git y empaquetada automáticamente por Compose Desktop):
+
+- `milimusic-login.exe` y `WebView2Loader.dll` (desde `desktop/native/webview2-login/main.cpp` y el paquete NuGet `Microsoft.Web.WebView2`).
+- `milimusic_smtc.dll` (desde `desktop/native/smtc-bridge/smtc_bridge.cpp`).
+- `vlc/` con `libvlc.dll`, `libvlccore.dll` y plugins de audio de libVLC 3.0.21 win64.
+
+El workflow `.github/workflows/build-windows.yml` contiene los comandos exactos de PowerShell y `cl` para generar todos estos recursos automáticamente.
+
+## Pruebas y ejecución
+
+```powershell
+# Ejecutar pruebas unitarias de ambos módulos
+./gradlew :innertube:test :desktop:test
+
+# Iniciar la aplicación en local
+./gradlew :desktop:run
 ```
 
-### GitHub Secrets Configuration
+## Generación de paquetes de Windows
 
-This project uses GitHub Secrets to securely store API keys for building releases. To set up the secrets:
+```powershell
+# Instalador EXE
+./gradlew :desktop:packageExe
 
-1. Go to your GitHub repository settings
-2. Navigate to **Settings** → **Secrets and variables** → **Actions**
-3. Add the following repository secrets:
-   - `LASTFM_API_KEY`: Your LastFM API key
-   - `LASTFM_SECRET`: Your LastFM secret key
+# Instalador MSI
+./gradlew :desktop:packageMsi
 
-4. Get your LastFM API credentials from: https://www.last.fm/api/account/create
+# Carpeta distribuible (para versión portable ZIP)
+./gradlew :desktop:createDistributable
+```
 
-**Note:** These secrets are automatically injected into the build process via GitHub Actions and are not visible in the source code.
-
-## AI note
-
-Metrolist does allow LLM generated contributions, but you should follow guidelines in AGENTS.md to ensure the quality of the contributions. Please use the ponytail skill from this url - https://github.com/DietrichGebert/ponytail/raw/refs/heads/main/skills/ponytail/SKILL.md - this is needed to keep work minimal and clean.  
-Do not try to hide your LLM contributions, we know what you are doing.
+Los artefactos generados se ubican en `desktop/build/compose/binaries/main/`.

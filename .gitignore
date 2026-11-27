@@ -1,0 +1,22 @@
+# Gradle
+.gradle/
+**/build/
+local.properties
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+
+# Windows native build & bundled runtime artifacts
+desktop/resources/windows/
+desktop/native/packages/
+desktop/native/vlc.7z
+desktop/native/vlc-extract/
+*.obj
+*.exp
+*.lib
+
+# OS files
+.DS_Store
+Thumbs.db
